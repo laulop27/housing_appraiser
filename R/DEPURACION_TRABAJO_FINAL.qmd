@@ -1,0 +1,1042 @@
+---
+title: "TRABAJO_FINAL"
+format: 
+  html:
+    theme: united
+    embed-resources: true
+    toc: true
+    toc-location: right
+    toc-title: Índice
+    toc-depth: 10
+editor: visual
+author: Cristina Martinez, Laura López, Veronica Yebra, Marina Parra
+---
+
+# 0. Carga de librerias y datos
+
+```{r}
+library(tidyverse)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(dbscan)
+library(concaveman)
+library(tmap)
+library(rpart)
+library(rpart.plot)
+library(patchwork)
+library(spdep)
+```
+
+```{r}
+# importamos la base de datos
+datos <- read.csv("Data_Housing_Madrid.csv", stringsAsFactors = TRUE)
+head(datos) # viviendas de madrid con sus características
+```
+
+# 1. Depuracion inicial de la base de datos
+
+## 0. Exploracion incial
+
+```{r}
+summary(datos)
+```
+
+## 1. Actualización del precio
+
+La base de datos es del año 2010, por lo que tenemos que actualizar el precio medio de las casas con la variable `house.price`. Para ello, se utilizan datos del Ministerio de Vivienda (Observatorio de Vivienda y Suelo), concretamente el valor tasado de la vivienda (€/m²) para municipios de más de 25.000 habitantes en la Comunidad de Madrid.
+
+Para actualizar los datos, lo hacemos aplicando la tasa de crecimiento a los datos:
+
+$Precio_{Actualizado} = Precio_{Original} \times \left(1 + \frac{\text{Porcentaje de Crecimiento}}{100}\right)$
+
+En este caso, los valores considerados son:
+
+-   2010 (T1): 3296.3 €/m²
+
+-   2025 (T4): 5286.2 €/m²
+
+```{r}
+# tasa de variación desde 2010 hasta 2025
+tasa_variacion <- (5286.2-3296.3)/3296.3
+
+# Creamos una nueva columna con el precio total actualizado a 2026
+datos$precio_actualizado <- datos$house.price * (1 + tasa_variacion)
+```
+
+## 2. Imputar los NA
+
+Con la exploracion de datos, hemos visto que existen valores faltantes en las variables categoricas codificados como ***ZZZ***. Vamos a imputar dichos valores de las variables `type.house`, `floor`, `good.cond`, `garage`, `elevator`, `air.cond`, `swimming.pool`.
+
+> Para las variables binarias `garage`, `elevator`, `air.cond` y `swimming.pool`, se asumió que la ausencia de información sobre la disponibilidad de estas características equivale a su no presencia en la vivienda. Por tanto, los valores no observados en estas variables fueron imputados con el valor 0.
+
+```{r}
+datos <- datos |>
+  mutate(
+    garage = case_when(
+      trimws(as.character(garage)) == "si"  ~ 1,
+      trimws(as.character(garage)) == "no"  ~ 0,
+      trimws(as.character(garage)) == "ZZZ" ~ 0
+    ),
+    elevator = case_when(
+      trimws(as.character(elevator)) == "si"  ~ 1,
+      trimws(as.character(elevator)) == "no"  ~ 0,
+      trimws(as.character(elevator)) == "ZZZ" ~ 0
+    ),
+    air.cond = case_when(
+      trimws(as.character(air.cond)) == "si"  ~ 1,
+      trimws(as.character(air.cond)) == "no"  ~ 0,
+      trimws(as.character(air.cond)) == "ZZZ" ~ 0
+    ),
+    swimming.pool = case_when(
+      trimws(as.character(swimming.pool)) == "si"  ~ 1,
+      trimws(as.character(swimming.pool)) == "no"  ~ 0,
+      trimws(as.character(swimming.pool)) == "ZZZ" ~ 0
+    )
+  )
+summary(datos)
+```
+
+> En cambio, las variables `type.house` y `floor`, al no ser binarias, se imputaron mediante un árbol de clasificación. Este método permite estimar la categoría más probable de cada observación a partir del resto de variables disponibles en la base de datos.
+
+-   **TYPE.HOUSE**
+
+```{r}
+#################################################
+# 1. TYPE.HOUSE
+#################################################
+set.seed(12345)
+# Filas con valor conocido
+train_type <- datos[
+  datos$type.house != "ZZZ",]
+
+# Filas con missing
+test_type <- datos[
+  datos$type.house == "ZZZ",]
+
+# Árbol de clasificación
+arbol_type <- rpart(
+  type.house ~ built.area +
+    baths +
+    age +
+    garage +
+    elevator +
+    air.cond +
+    swimming.pool +
+    good.cond +
+    floor +
+    precio_actualizado +
+    crime +
+    shopping +
+    historical,
+  data = train_type,
+  method = "class")
+
+# Predicción
+pred_type <- predict(
+  arbol_type,
+  test_type,
+  type = "class")
+
+# Reemplazo
+datos$type.house[
+  datos$type.house == "ZZZ"] <- pred_type
+
+```
+
+```{r}
+rpart.plot(arbol_type,extra=105,nn=TRUE,tweak=1.2)
+```
+
+Para imputar la variable `type.house`, se utilizó un árbol de clasificación. La variable más relevante fue la superficie construida (`built.area`), observándose que las viviendas de menos de 242 m² se clasificaban mayoritariamente como pisos, mientras que en viviendas de gran tamaño la presencia o ausencia de ascensor (`elevator`) permitía distinguir principalmente entre pisos y chalets.
+
+```{r}
+table(datos$type.house)
+```
+
+-   **FLOOR**
+
+```{r}
+#################################################
+# 2. FLOOR
+#################################################
+set.seed(12345)
+# Filas con valor conocido
+train_floor <- datos[
+  datos$floor != "ZZZ",]
+
+# Filas con missing
+test_floor <- datos[
+  datos$floor == "ZZZ",]
+
+# Árbol de clasificación
+arbol_floor <- rpart(
+  floor ~ built.area +
+    baths +
+    age +
+    elevator +
+    garage +
+    air.cond +
+    swimming.pool +
+    type.house +
+    good.cond +
+    precio_actualizado +
+    crime +
+    shopping +
+    historical,
+  data = train_floor,
+  method = "class",
+  control = rpart.control(
+    cp = 0.001,
+    minbucket = ceiling(0.05 * nrow(train_floor)),
+    minsplit = 20))
+
+# Predicción
+pred_floor <- predict(
+  arbol_floor,
+  test_floor,
+  type = "class")
+
+# Reemplazo
+datos$floor[
+  datos$floor == "ZZZ"] <- pred_floor
+
+```
+
+```{r}
+library(rpart.plot)
+rpart.plot(
+  arbol_floor,
+  extra = 105,
+  nn = TRUE,
+  tweak = 1.2,
+  box.palette = "Greens")
+```
+
+```{r}
+levels(train_floor$floor)
+```
+
+Para imputar la variable `floor`, se ajustó un árbol de clasificación. La variable más relevante fue la presencia de ascensor (`elevator`), observándose que las viviendas sin ascensor tendían a localizarse en plantas intermedias, mientras que en viviendas con ascensor el tipo de vivienda (`type.house`) permitía diferenciar especialmente entre pisos convencionales y viviendas situadas en plantas altas como áticos.
+
+```{r}
+table(datos$floor)
+```
+
+> Una vez imputado todos los valores faltantes, vamos a pasar dichas variables categoricas a factor y todavia nos falta imputar `good.cond`.
+
+```{r}
+summary(datos)
+```
+
+```{r}
+categoricas <- c(
+  "shopping",
+  "historical",
+  "type.house",
+  "floor",
+  "garage",
+  "elevator",
+  "air.cond",
+  "swimming.pool",
+  "M.30")
+
+datos <- datos |> 
+  mutate(across(all_of(categoricas), as.factor))
+```
+
+Ahora eliminamos la categoria ZZZ de `type.house` y `floor`:
+
+```{r}
+datos$type.house <- droplevels(datos$type.house)
+datos$floor <- droplevels(datos$floor)
+
+table(datos$type.house)
+table(datos$floor)
+```
+
+Imputamos `good.cond`:
+
+```{r}
+datos <- datos |>
+  mutate(
+    good.cond = as.character(good.cond),
+    good.cond = ifelse(good.cond == "ZZZ", "bueno", good.cond),
+    good.cond = as.factor(good.cond)
+  )
+
+datos$good.cond <- as.factor(datos$good.cond)
+datos$good.cond <- droplevels(datos$good.cond)
+
+table(datos$good.cond)
+```
+
+Una vez finalizado el proceso de imputación,transformamos la base de datos en un objeto espacial para poder realizar posteriormente el análisis espacial, construir mapas, calcular medidas de dependencia espacial e implementar métodos de interpolación o modelización espacial.
+
+```{r}
+# convertimos los datos a un objeto especial
+datos_sf <- st_as_sf(datos, 
+                     coords = c("longitude", "latitude"), 
+                     crs = 4326) # WGS84
+```
+
+## 3. Limpieza espacial inicial
+
+Dentro de la depuración espacial de la base de datos, buscamos quedarnos con los datos que tienen al menos 6 vecinos proximos. Para ello, usamos el algoritmo `DBSCAN` con el objetivo de identificar zonas con suficiente concentración de viviendas. De esta forma, se conservaron únicamente aquellas viviendas localizadas en áreas con una densidad suficiente de testigos, eliminando puntos aislados o situados en zonas con poca información disponible.
+
+Este procedimiento permite definir una ventana espacial de trabajo más fiable. Si una nueva vivienda se encuentra dentro de alguno de los clústeres identificados, el modelo dispone de observaciones cercanas sobre las que apoyar la predicción. En cambio, si se encuentra fuera de estas agrupaciones, se considera que no existen testigos suficientes para ofrecer una valoración robusta.
+
+```{r}
+# Transformamos las coordenadas a metros para aplicar DBSCAN
+datos_sf_metros <- st_transform(datos_sf, 25830)
+
+# Extraemos las coordenadas proyectadas
+coords_metros <- st_coordinates(datos_sf_metros)
+
+# Aplicamos DBSCAN: mínimo 6 viviendas en un radio de 400 metros
+modelo_dbscan <- dbscan(coords_metros, eps = 400, minPts = 6)
+
+# Añadimos el identificador del clúster al objeto espacial
+datos_sf_metros$cluster_dbscan <- modelo_dbscan$cluster
+
+# Separamos las viviendas agrupadas y las observaciones aisladas
+datos_limpios <- datos_sf_metros %>% 
+  filter(cluster_dbscan != 0)
+
+datos_ruido <- datos_sf_metros %>% 
+  filter(cluster_dbscan == 0)
+
+cat("Viviendas originales:", nrow(datos_sf_metros), "\n")
+cat("Viviendas conservadas:", nrow(datos_limpios), "\n")
+cat("Viviendas eliminadas como ruido:", nrow(datos_ruido), "\n")
+```
+
+```{r}
+# Creamos el area cóncava: generamos el polígono que envuelve los puntos ajustándose a su forma
+area_concava <- concaveman(datos_limpios)
+
+# Dibujamos los puntos agrupados por color (para ver si parecen barrios) 
+# Convertimos el cluster a factor (texto) para que ggplot ponga colores distintos
+datos_limpios$cluster_dbscan <- as.factor(datos_limpios$cluster_dbscan)
+
+ggplot() +
+  geom_sf(data = area_concava, fill = "gray90", color = "black", size = 0.5, alpha = 0.5) +
+  # Pintamos los pisos limpios, coloreados por su grupo de DBSCAN
+  geom_sf(data = datos_limpios, aes(color = cluster_dbscan), size = 1, alpha = 0.7) +
+  
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Clusters DBSCAN y Área Cóncava",
+    subtitle = "Datos depurados: min 6 vecinos en radio de 400m",
+    x = "Longitud (Metros)",
+    y = "Latitud (Metros)")
+```
+
+> Cada cluster (cada mancha de color) le dice a tu modelo: "Aquí hay suficientes datos (testigos) como para que lo que prediga sea fiable". Si un piso está dentro de un cluster, significa que tiene al menos 6 vecinos a menos de 400 metros. Eso da solidez estadística a tu valoración.
+
+Hemos eliminado las observaciones especialmente aisladas mediante DBSCAN y lo mostramos con el área cóncava.
+
+Ahora, queremos saber si tenemos datos que no tengan sentido, por ejemplo, que nos salgan viviendas en la Casa de Campo o en el Retiro. Para identificar este tipo de casos anómalos, realizamos una inspección visual sobre el mapa de Madrid.
+
+```{r}
+tmap_mode("view")
+
+# Volvemos a WGS84 para visualizar sobre mapa web
+datos_limpios_wgs84 <- st_transform(datos_limpios, 4326)
+datos_ruido_wgs84  <- st_transform(datos_ruido, 4326)
+# nos creamos un identificador
+datos_limpios_wgs84$id_fila <- 1:nrow(datos_limpios_wgs84)
+coords <- st_coordinates(datos_limpios_wgs84)
+datos_limpios_wgs84$longitude <- coords[,1]
+datos_limpios_wgs84$latitude  <- coords[,2]
+
+tm_shape(datos_limpios_wgs84) +
+  tm_dots(
+    col = "black",
+    size = 0.05,
+    popup.vars = c("ID" = "id_fila",
+                   "Longitud" = "longitude",
+                   "Latitud" = "latitude")
+  ) +
+  tm_basemap("OpenStreetMap")
+```
+
+Observamos que nos salen algunas viviendas de `datos_limpios` en zonas no residenciales, como por ejemplo: El Retiro, el cementerio de la Almudena, Faunia, el Cerro de San Isidro, el Parque Emperatriz María de Austria, la Quinta de los Molinos, el Parque del Oeste o el Parque Juan Carlos I.
+
+Vamos a seleccionar el perimetro de esas zonas por coordenadas y todos las viviendas de caigan dentro las eliminaremos.
+
+```{r}
+# Partimos de los puntos limpios
+datos_limpios_wgs84 <- st_transform(datos_limpios, 4326)
+
+# Crear cajas de exclusión aproximadas
+# 1. RETIRO: ponemos mas coordenadas porque sino nos borra viviendas que no hay que borrar
+coords_retiro <- matrix(c(
+  -3.6895, 40.4095,
+  -3.6765, 40.4095,
+  -3.6735, 40.4145,
+  -3.6745, 40.4205,
+  -3.6815, 40.4220,
+  -3.6888, 40.4175,
+  -3.6895, 40.4095
+), ncol = 2, byrow = TRUE)
+
+retiro <- st_sfc(st_polygon(list(coords_retiro)), crs = 4326)
+
+# 2. CEMENTERIO DE LA ALMUDENA
+coords_almudena <- matrix(c(
+  -3.6465, 40.4210,
+  -3.6330, 40.4210,
+  -3.6310, 40.4255,
+  -3.6325, 40.4305,
+  -3.6415, 40.4310,
+  -3.6470, 40.4275,
+  -3.6465, 40.4210
+), ncol = 2, byrow = TRUE)
+
+almudena <- st_sfc(st_polygon(list(coords_almudena)), crs = 4326)
+
+# 3. PARQUE EMPERATRIZ MARÍA DE AUSTRIA
+coords_emperatriz <- matrix(c(
+  -3.7270, 40.3825,
+  -3.7160, 40.3825,
+  -3.7138, 40.3875,
+  -3.7155, 40.3920,
+  -3.7225, 40.3922,
+  -3.7275, 40.3885,
+  -3.7270, 40.3825
+), ncol = 2, byrow = TRUE)
+
+emperatriz_maria_austria <- st_sfc(st_polygon(list(coords_emperatriz)), crs = 4326)
+
+# 4. PRADOLONGO
+coords_pradolongo <- matrix(c(
+  -3.7145, 40.3695,
+  -3.7045, 40.3695,
+  -3.7020, 40.3735,
+  -3.7040, 40.3775,
+  -3.7105, 40.3778,
+  -3.7148, 40.3745,
+  -3.7145, 40.3695
+), ncol = 2, byrow = TRUE)
+
+pradolongo <- st_sfc(st_polygon(list(coords_pradolongo)), crs = 4326)
+
+faunia <- st_as_sfc(st_bbox(c(
+  xmin = -3.610, xmax = -3.594,
+  ymin = 40.392, ymax = 40.402
+), crs = 4326))
+
+san_isidro <- st_as_sfc(st_bbox(c(
+  xmin = -3.732, xmax = -3.719,
+  ymin = 40.395, ymax = 40.404
+), crs = 4326))
+
+quinta_molinos <- st_as_sfc(st_bbox(c(
+  xmin = -3.648, xmax = -3.632,
+  ymin = 40.438, ymax = 40.449
+), crs = 4326))
+
+parque_oeste <- st_as_sfc(st_bbox(c(
+  xmin = -3.731, xmax = -3.715,
+  ymin = 40.423, ymax = 40.435
+), crs = 4326))
+
+juan_carlos <- st_as_sfc(st_bbox(c(
+  xmin = -3.616, xmax = -3.594,
+  ymin = 40.456, ymax = 40.470
+), crs = 4326))
+
+# Unir todas las zonas
+zonas_excluir <- st_sf(
+  nombre = c(
+    "Retiro", "Almudena", "Faunia", "San Isidro",
+    "Emperatriz Maria de Austria", "Quinta de los Molinos",
+    "Parque del Oeste", "Juan Carlos I"
+  ),
+  geometry = st_sfc(
+    retiro[[1]], almudena[[1]], faunia[[1]], san_isidro[[1]],
+    emperatriz_maria_austria[[1]], quinta_molinos[[1]],
+    parque_oeste[[1]], juan_carlos[[1]],
+    crs = 4326
+  )
+)
+
+# Detectar puntos dentro de esas zonas
+inter <- st_intersects(datos_limpios_wgs84, zonas_excluir, sparse = FALSE)
+
+datos_excluidos <- datos_limpios_wgs84[apply(inter, 1, any), ]
+datos_finales   <- datos_limpios_wgs84[!apply(inter, 1, any), ]
+
+cat("Puntos antes:", nrow(datos_limpios_wgs84), "\n")
+cat("Puntos excluidos:", nrow(datos_excluidos), "\n")
+cat("Puntos finales:", nrow(datos_finales), "\n")
+```
+
+En *datos_finales* tenemos todas las viviendas que no estan en zonas no residenciales, es decir, en en *datos_finales* ya tenemos todas las viviendas que estan correctamente ubicadas (muestra depurada espacialmente).
+
+-   datos: tabla original
+-   datos_sf: lo mismo pero en objeto espacial
+-   datos_sf_metros: lo mismo pero proyectado en metros para DBSCAN
+-   datos_limpios: muestra ya depurada espacialmente
+
+## 4. Outliers
+
+Ahora vamos estudiar los outliers de las variables.
+
+> No tiene sentido estudiar los outliers en las variables binarias asique esas variables no las estudiaremos.
+
+```{r}
+library(patchwork)
+outliers <- function(datos_finales, variable) {
+  var_name <- datos_finales[[variable]]  # Acceder a la variable por nombre
+  
+  tot <- sum(!is.na(var_name))  # Total de observaciones no NA
+  na1 <- sum(is.na(var_name))   # NA iniciales
+  
+  # Identificar outliers usando la regla de Tukey (coef = 1.5)
+  stats_outliers <- boxplot.stats(var_name, coef = 1.5)
+  outlier_values <- stats_outliers$out  
+  prop_outliers <- round(length(outlier_values) / tot * 100, 2)  # Proporción de outliers
+  
+  # Identificar valores extremos usando la regla de Tukey (coef = 3.0)
+  stats_extremes <- boxplot.stats(var_name, coef = 3.0)
+  extreme_values <- stats_extremes$out  
+  prop_extremes <- round(length(extreme_values) / tot * 100, 2)  # Proporción de valores extremos
+  
+  # Filtrar datos sin outliers ni valores extremos
+  data_no_outliers <- 
+    data.frame(value = var_name) |> 
+    filter(!(value %in% c(outlier_values, extreme_values)))
+  
+    # Histograma con todos los datos
+  p1 <- ggplot(data.frame(value = var_name), aes(x = value)) +
+    geom_histogram(fill = "steelblue", color = "black", bins = 30, alpha = 0.7) +
+    labs(title = "All Observations", x = variable, y = "Count") +
+    theme_minimal()
+  
+  # Boxplot con outliers resaltados
+  p2 <- ggplot(data.frame(value = var_name), aes(x = value)) +
+    geom_boxplot(outlier.colour = "red", outlier.shape = 16, outlier.size = 3) +
+    labs(title = "Boxplot with Outliers", x = variable, y = "") +
+    theme_minimal()
+  
+  # Mostrar gráficos juntos con patchwork
+  print(p1 / p2)
+  
+  # Mostrar información en la consola
+  cat("\n📌 Outliers identified in", variable, ":", length(outlier_values), "outliers\n")
+  cat("📊 Proportion (%) of outliers:", prop_outliers, "%\n")
+  cat("\n🚨 Extreme values identified in", variable, ":", length(extreme_values), "extreme values\n")
+  cat("📊 Proportion (%) of extreme values:", prop_extremes, "%\n")
+  
+  return(list(outliers = outlier_values, extremes = extreme_values))  # Devolver ambos valores
+}
+```
+
+```{r}
+# Aplicar la función a múltiples variables no binarias
+vars_binarias <- c(
+  "shopping",
+  "historical",
+  "garage",
+  "elevator",
+  "air.cond",
+  "swimming.pool",
+  "M.30"
+)
+# Nos quedamos solo con variables numéricas no binarias
+vars_outliers <- names(datos_finales)[
+  sapply(datos_finales, is.numeric) & 
+  !(names(datos_finales) %in% vars_binarias)
+]
+
+# Aplicar la función 'outliers' a cada una de las variables numéricas
+outliers_results <- lapply(vars_outliers, function(var) {
+outliers(datos_finales, var) # Llamar a la función pasando el nombre de la variable
+})
+```
+
+El análisis de valores atípicos lo hemos hecho usando la regla de Tukey sobre las variables cuantitativas. En variables como la antigüedad o el número de baños, los valores extremos se consideraron plausibles dentro de la heterogeneidad del mercado inmobiliario, por lo que no se eliminaron automáticamente. La variable que vamos a revisar mas es la de la superficie construida, ya que presenta observaciones muy elevadas que podrian estar asociadas a errores de registro o a inmuebles muy singulares.
+
+Observamos las observaciones que nos han salido atipicas para `built.area`:
+
+```{r}
+area_mas1000 <- datos_finales |>
+  filter(built.area > 1000) |>
+  st_drop_geometry()
+area_mas1000
+```
+
+Vemos que para las 5 observaciones con valores atipicos que nos salen, el tipo de casa es 'Chalet' entre 1100 y 2500 m² y con 6 o 7 baños por lo que no es disparatado y vamos a considerar que no son outliers.
+
+## 5. Analisis exploratorio espacial
+
+La variable objetivo es el precio por metro cuadrado:
+
+```{r}
+datos_finales <- datos_finales |>
+  mutate(
+    precio_m2 = precio_actualizado,
+    log_precio_m2 = log(precio_m2))
+```
+
+Hacemos el log del precio para dejar de tener una variable muy asimetrica y tener otra más manejable donde se reduce la asimetria y hace que la variable no tenga una distribución tan sesgada, lo que es bueno para trabajar con Moran, residuos, semivariograma y kriging.
+
+Para trabajar mejor quitamos el sf:
+
+```{r}
+datos_desc <- datos_finales |>
+  st_drop_geometry()
+```
+
+```{r}
+summary(datos_desc)
+str(datos_desc)
+nrow(datos_desc)
+```
+
+> En primer lugar, se realiza un análisis exploratorio de la variable de interés mediante estadísticos descriptivos, representación cartográfica y análisis de su distribución. El objetivo es comprobar si existen patrones espaciales visibles antes de aplicar contrastes formales de autocorrelación espacial.
+
+-   **Histograma del precio actualizado y el logaritmo**
+
+```{r}
+p1 <- ggplot(datos_desc, aes(x = precio_actualizado)) + 
+  geom_histogram(fill = "pink", color = "white") + 
+  labs(title = "Precio Original") + theme_minimal()
+
+p2 <- ggplot(datos_desc, aes(x = log_precio_m2)) + 
+  geom_histogram(fill = "lightblue", color = "white") + 
+  labs(title = "Precio Actualizado") + theme_minimal()
+
+p1+p2
+```
+
+-   **Tabla con estadísticos**
+
+```{r}
+library(skimr)
+datos_desc |> 
+  st_drop_geometry() |> 
+  select(where(is.numeric)) |> 
+  skim()
+```
+
+-   **Matriz de correlación para observar como se comportan las variables entre ellas**
+
+```{r}
+library(ggcorrplot)
+
+# Calcular matriz de correlación
+corr_matrix <- datos_desc |> 
+  st_drop_geometry() |> 
+  select(where(is.numeric)) |> 
+  cor(use = "complete.obs") # Ignora valores faltantes
+
+# Graficar
+ggcorrplot(corr_matrix, 
+           hc.order = TRUE, 
+           type = "lower", 
+           lab = TRUE, 
+           colors = c("#6D9EC1", "white", "#E46726"))
+```
+
+```{r}
+tmap_mode("plot")
+
+tm_shape(datos_finales) +
+  tm_dots(
+    col = "precio_m2",
+    size = 0.04,
+    style = "quantile",
+    n = 6,
+    palette = "RdYlBu",
+    title = "Precio €/m2") +
+  tm_layout(
+    title = "Precio por m2 por cuantiles",
+    legend.outside = TRUE)
+```
+
+ESTO ES PARTE DE LA PARTE DEL ANÁLISIS DESCRIPTIVO ESPACIAL: hay que hacer todo lo que solemos hacer de ver la distribución de las variables además hay que hacer lo de los mapas coropléticos que acabamos de ver para ver las zonas y agrupar los objetos espaciales → esto al final es como hacer un análisis cluster pero con el concepto de dependencia espacial. si se sospecha con los mapas coropléticos que hay correlación espacial, y para cuantificarlo calculo la I DE MORAN Y la matriz de pesos de tipo reina para ver con este índice si realmente la hay o no y poder modelizarla. ; \*\*del trabajo: un raster del precio de la vivienda en madrid o ventana que recoja las viviendas de madrid. El raster es para hacer una cuadrícula con el precio medio de esa zona para que cuando nos venga un dato nuevo, identifiquemos a qué cuadrícula pertenece y se lo asignemos. ; LA INTERPOLACIÓN Para cada una de las variables, nosotros usaremos los de idealista para estimar los precios en todas y con una función de la libraria sf calcularemos la cuadrícula con el precio medio de esa zona para que cuando nos venga un dato nuevo, identifiquemos a qué cuadrícula pertenece y se lo asignemos. ;
+
+ej. trabajo: ¿cómo convierto a estacionario el precio de la vivienda? como tmbn depende de la heterogeneidad de la vivienda, estacionamos con un modelo de regresión lineal (bueno tmbn podemos hacerlo con árboles o cosas asi pero es más complejo). VA A VALORAR USAR OTRA COSA → RF. se convierte a estacionario creando un modelo que sea capaz de captar la heterogeneidad. Pvivienda= 0+1· metros2+2· altura + 3· ascensor + .... Para ver el efecto de la ubicación, hace un modelo sin la ubicación para que cuando lo añadas puedas ver su efecto. Los residuos recogen la parte de la variable que no está explicada por las explicativas. El precio medio no es estacionario porque no todas las viviendas son iguales. residuos con semivariograma plano → que los residuos no tenían dependencia, es decir, el modelo conseguía capturar toda la dependencia. Tenemos que demostrar que los residuos consiguen un semivariograma plano. la función variogram(z \~ 1, datos) por defecto así está haciendo un modelo en el que no usa ninguna como explicativa. ; la librari gstat que usamos solo permite usar modelo lineal para intentar captar esa componente de heterogeneidad. Es decir, para el trabajo si queremos en vez de una regresión lineal, un RF como no podemos usar directamente variogram(z \~ 1, datos), lo que tenemos que hacer es crear el modelo aparte, extraer los residuos y analizarlos residuos ;
+
+Como en la base de datos de idealista tenemos muchísimas observaciones (10.000 aprox), hacemos un muestreo de testigos con 500 para train y 200 para test. ¿Hay dependencia espacial? para ver si existe esta dependencia se analiza con el semivariograma. cómo sabemos si la serie es estacionaria→ si es semi esta creciendo es porq hay una tendencia creciente en esa ubicación → si existe esta tendencia para estacional¡rizarla se crea un modelo hedónico con las características de las viviendas. de este modelo se extraen los residuos de los cuales queremos ver si son … el semivariograma plano se denomina de efecto pepita A PARTIR DE AQUÍ YA TRABAJAMOS CON LOS RESIDUOS: SI EN EL BARRIO DE SALAMANCA TODOS LOS RESIDUOS SON + ES PORQUE NO HEMOS SABIDO MODELIZAR TODA LA DEPENDENCIA. después tenemos que calcular los pesos. por el método de la distancia y el kriging obtenemos los pesos: con el método de kriging que es de optimización y minimiza la varianza del error de predicción. como se hace con gstat?? --\> este trabajo quiere que lo hagamos con la base de datos que te he pasado
+
+=0+1*m2 +...+* Wln(precio de las de alrededor) → de este modelo sacamos los residuos y vemos si tienen dependencia espacial que se hace con la I de Moran (lo del semivariograma es para mirarlo en la parte del kriging). si no hay dependencia espacial en los residuos entonces este modelo sería el definitivo. si en cambio sí existe dependencia espacial es porque hay cierta correlación que no estamos sabiendo explicar, por lo que tendremos que tratar de modelizarlo con los retardos, esto se hace añadiendo al modelo la variable retardada. en la base de datos tenemos el precio por metro cuadrado, así que vamos a modelizar/estimar esta variable y cuando la tengamos lo multiplicamos por los m2 para obtener el precio total → pero esto al final al hacer el mapa coroplético vemos si hay zonas más caras o más baratas → para ver si hay o no dependencia espacial PASOS PARA EL TRABAJO 1º hay que hacer no solo el mapa coroplético sino calcular el índice de I de Moran para ver si hay. la I toma valores entre -1 y 1, si toma valores negativos es correlación negativa, si toma valores positivos correlación positiva y si es 0 no hay correlación. La I de Moran es un indicador que nos mide H0: independencia espacial, si nos sale que hay independencia no tienen sentido hacer todo lo de la I de Moran local. el local sirve para ver si uno en particular tienen correlación espacial o no. ej: ver is una vivienda tienen asociación espacial significativa o no (es decir si depende de las de su entorno o no). las que tienen dependencia significativa las dividimos en 4 cuadrantes y las nos significativas las dejamos aparte (las ponemos un gris) de esta forma: los que tienen valor \< 0.05 es significativo y por eso lo representamos con colores. los que no eran significativos los dejamos en gris → eso es lo que quiere para el trabajo
+
+------------------------------------------------------------------------
+
+Primera visualizacion de los precios de la vivienda en Madrid. Vamos a hacer un mapa exploratorio de puntos del precio de la vivienda para ver visualmente las zonas caras y baratas.
+
+```{r}
+# ------------------------------------------------------------
+# MAPA EXPLORATORIO DE PUNTOS
+# ------------------------------------------------------------
+
+tmap_mode("plot")
+
+# 1. Pasar puntos a metros para hacer el contorno
+datos_madrid_m <- datos_finales |>
+  st_transform(25830)
+
+# 2. Crear contorno aproximado
+contorno_madrid <- concaveman::concaveman(datos_madrid_m)
+
+contorno_madrid <- st_sf(
+  geometry = st_geometry(contorno_madrid),
+  crs = st_crs(datos_madrid_m))
+
+# 3. Pasar TODO a 3857 para poder usar tm_basemap()
+datos_plot <- datos_madrid_m |>
+  st_transform(3857)
+
+contorno_plot <- contorno_madrid |>
+  st_transform(3857)
+
+# 4. Mapa estilo como el de tu amigo
+tm_shape(contorno_plot) +
+  tm_polygons(
+    col = NA,
+    fill_alpha = 0) +
+  tm_basemap("CartoDB.Positron") +
+  tm_shape(datos_plot) +
+  tm_symbols(
+    col = "precio_m2",      # cambia esto si tu variable se llama distinto
+    style = "quantile",
+    n = 5,
+    palette = "-RdBu",
+    size = 0.4,
+    alpha = 1,
+    title.col = "Precio (€/m²)") +
+  tm_layout(
+    title = "Distribución espacial del precio de la vivienda",
+    title.size = 1.3,
+    title.fontface = "bold",
+    title.position = c("center", "top"),
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE) +
+  tm_credits(
+    "Municipio de Madrid",
+    position = c("center", "top"))
+```
+
+Este mapa constituye una primera aproximación exploratoria para identificar posibles patrones de dependencia espacial en el precio de la vivienda. Se observa una concentración de precios más elevados, representados en tonos rojos, en la zona norte del municipio y en áreas como Aravaca, mientras que los precios más bajos, representados en tonos azules, se localizan principalmente en la periferia y en el sur de Madrid. Esto sugiere que el precio de la vivienda no se distribuye aleatoriamente en el espacio, sino que podría existir cierta autocorrelación espacial.
+
+```{r}
+library(sf)
+library(openxlsx)
+
+saveRDS(
+  datos_finales,
+  "datos_depurados.rds"
+)
+```
+
+### I de Morgan
+
+```{r}
+# ------------------------------------------------------------
+# I DE MORAN GLOBAL - PRECIO DE LA VIVIENDA EN MADRID
+# ------------------------------------------------------------
+
+# 1. Pasamos los datos a CRS métrico
+# Mejor 25830 para Madrid/España: coordenadas en metros
+datos_moran <- datos_finales |>
+  st_transform(25830) |>
+  filter(!is.na(house.price))   # cambia house.price si tu variable tiene otro nombre
+
+# 2. Creamos la variable en logaritmos
+# Si house.price es precio €/m², perfecto. Si es precio total, también se puede,
+# pero para vivienda normalmente interesa precio/m2.
+datos_moran <- datos_moran |>
+  mutate(
+    log_price = log(house.price))
+
+# 3. Extraemos coordenadas
+coords <- st_coordinates(datos_moran)
+
+# 4. Creamos vecinos: k vecinos más cercanos
+# Para puntos de vivienda es mejor que contigüidad tipo reina.
+# k = 8 suele ser razonable para empezar.
+knn_8 <- knearneigh(coords, k = 8)
+
+nb_knn_8 <- knn2nb(knn_8)
+
+# 5. Convertimos vecinos en matriz/lista de pesos espaciales
+# style = "W" normaliza por filas: los pesos de cada vivienda suman 1
+W_knn_8 <- nb2listw(nb_knn_8, style = "W", zero.policy = TRUE)
+
+# 6. Precio retardado espacialmente
+# Esto es el precio medio ponderado de las viviendas vecinas
+datos_moran$log_price_W <- lag.listw(
+  W_knn_8,
+  datos_moran$log_price,
+  zero.policy = TRUE)
+
+# 7. Gráfico de Moran
+plot(
+  datos_moran$log_price,
+  datos_moran$log_price_W,
+  xlab = "log(precio)",
+  ylab = "W log(precio)",
+  main = "Gráfico de Moran - Precio de la vivienda")
+
+abline(
+  lm(log_price_W ~ log_price, data = datos_moran),
+  col = "red",
+  lwd = 2)
+
+# 8. I de Moran Global
+I_Moran <- moran.test(
+  datos_moran$log_price,
+  listw = W_knn_8,
+  zero.policy = TRUE,
+  na.action = na.omit)
+
+I_Moran
+```
+
+El pvalor nos sale significativo. p-value \< 0.05, puedes decir que hay autocorrelación espacial positiva: las viviendas caras tienden a estar cerca de viviendas caras, y las baratas cerca de viviendas baratas. Esto justificaría seguir con modelos espaciales, retardos espaciales o kriging.
+
+Si la I de Moran es positiva y el p-valor es inferior a 0,05, se rechaza la hipótesis nula de independencia espacial. Esto indicaría que existe autocorrelación espacial positiva: las viviendas con precios altos tienden a localizarse cerca de otras viviendas caras, y las viviendas con precios bajos cerca de otras viviendas baratas.
+
+### Mapa LISA por cuadrícula del precio de la vivienda
+
+```{r}
+# ------------------------------------------------------------
+# MAPA LISA EN CUADRÍCULA
+# ------------------------------------------------------------
+
+
+# 1. Trabajamos en metros
+datos_grid <- datos_finales |>
+  st_transform(25830) |>
+  filter(!is.na(precio_m2)) |>
+  mutate(
+    log_precio_m2 = log(precio_m2))
+
+# 2. Contorno de Madrid
+contorno_madrid_m <- concaveman::concaveman(datos_grid)
+
+contorno_madrid_m <- st_sf(
+  geometry = st_geometry(contorno_madrid_m),
+  crs = st_crs(datos_grid))
+
+# 3. Crear cuadrícula
+# Puedes cambiar cellsize:
+# 300 = celdas pequeñas
+# 500 = equilibrio
+# 700 = celdas más grandes y más visibles
+grid_madrid <- st_make_grid(
+  contorno_madrid_m,
+  cellsize = 500,
+  square = TRUE)
+
+grid_madrid <- st_sf(
+  id_celda = 1:length(grid_madrid),
+  geometry = grid_madrid)
+
+# 4. Recortar la cuadrícula al contorno
+grid_madrid <- st_intersection(grid_madrid, st_union(contorno_madrid_m))
+
+grid_madrid <- st_sf(
+  id_celda = 1:nrow(grid_madrid),
+  geometry = st_geometry(grid_madrid),
+  crs = st_crs(datos_grid))
+
+# 5. Asignar cada vivienda a una celda
+puntos_en_celda <- st_join(
+  datos_grid,
+  grid_madrid,
+  join = st_within)
+
+# 6. Calcular precio medio por celda
+precio_celda <- puntos_en_celda |>
+  st_drop_geometry() |>
+  filter(!is.na(id_celda)) |>
+  group_by(id_celda) |>
+  summarise(
+    n_viviendas = n(),
+    precio_m2_medio = mean(precio_m2, na.rm = TRUE),
+    log_precio_m2_medio = mean(log_precio_m2, na.rm = TRUE),
+    .groups = "drop")
+
+# 7. Unir el precio medio a la cuadrícula
+grid_precio <- grid_madrid |>
+  left_join(precio_celda, by = "id_celda") |>
+  filter(!is.na(log_precio_m2_medio))
+
+# Opcional: quedarnos solo con celdas con suficientes viviendas
+# Así evitamos celdas con 1 vivienda que pueden ser poco fiables
+grid_precio <- grid_precio |>
+  filter(n_viviendas >= 3)
+
+# 8. Crear vecinos por contigüidad tipo reina
+vecinos_grid <- poly2nb(
+  grid_precio,
+  queen = TRUE)
+
+# Si hubiera alguna celda aislada, añadimos vecinos cercanos
+coords_grid <- st_coordinates(st_centroid(grid_precio))
+
+knn_grid <- knn2nb(
+  knearneigh(coords_grid, k = 4))
+
+vecinos_grid_final <- union.nb(vecinos_grid, knn_grid)
+
+# 9. Matriz de pesos normalizada por filas
+W_grid <- nb2listw(
+  vecinos_grid_final,
+  style = "W",
+  zero.policy = TRUE)
+
+# 10. Retardo espacial del precio medio
+grid_precio$log_precio_m2_W <- lag.listw(
+  W_grid,
+  grid_precio$log_precio_m2_medio,
+  zero.policy = TRUE)
+
+# 11. I de Moran local
+lmoran_grid <- localmoran(
+  grid_precio$log_precio_m2_medio,
+  listw = W_grid,
+  zero.policy = TRUE)
+
+grid_precio$Ii     <- lmoran_grid[, 1]
+grid_precio$E.Ii   <- lmoran_grid[, 2]
+grid_precio$Var.Ii <- lmoran_grid[, 3]
+grid_precio$Z.Ii   <- lmoran_grid[, 4]
+grid_precio$p_Ii   <- lmoran_grid[, 5]
+
+# 12. Clasificación por cuadrantes
+media_y  <- mean(grid_precio$log_precio_m2_medio, na.rm = TRUE)
+media_Wy <- mean(grid_precio$log_precio_m2_W, na.rm = TRUE)
+
+grid_precio <- grid_precio |>
+  mutate(
+    lisa_cluster = case_when(
+      is.na(p_Ii) ~ "No significativo",
+      p_Ii >= 0.05 ~ "No significativo",
+      log_precio_m2_medio >= media_y & log_precio_m2_W >= media_Wy ~ "Alto-Alto",
+      log_precio_m2_medio <  media_y & log_precio_m2_W <  media_Wy ~ "Bajo-Bajo",
+      log_precio_m2_medio >= media_y & log_precio_m2_W <  media_Wy ~ "Alto-Bajo",
+      log_precio_m2_medio <  media_y & log_precio_m2_W >= media_Wy ~ "Bajo-Alto",
+      TRUE ~ "No significativo"))
+
+# 13. Pasamos a 3857 para usar basemap
+grid_lisa_plot <- grid_precio |>
+  st_transform(3857)
+
+contorno_lisa_plot <- contorno_madrid_m |>
+  st_transform(3857)
+
+# 14. Mapa LISA estilo coroplético
+tmap_mode("plot")
+
+tm_shape(contorno_lisa_plot) +
+  tm_polygons(
+    col = "grey60",
+    fill_alpha = 0
+  ) +
+  tm_basemap("CartoDB.Positron") +
+  tm_shape(grid_lisa_plot) +
+  tm_polygons(
+    fill = "lisa_cluster",
+    col = "grey70",
+    lwd = 0.2,
+    fill.scale = tm_scale_categorical(
+      values = c(
+        "Alto-Alto" = "red",
+        "Bajo-Bajo" = "blue",
+        "Alto-Bajo" = "pink",
+        "Bajo-Alto" = "lightblue",
+        "No significativo" = "grey90"
+      )
+    ),
+    fill.legend = tm_legend(title = "Clusters LISA")
+  ) +
+  tm_layout(
+    title = "Mapa LISA del precio de la vivienda por cuadrícula",
+    title.size = 1.2,
+    title.fontface = "bold",
+    title.position = c("center", "top"),
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE
+  ) +
+  tm_credits(
+    "Municipio de Madrid",
+    position = c("center", "top")
+  )
+```
+
+```{r}
+# ------------------------------------------------------------
+# I DE MORAN LOCAL - MAPA LISA
+# ------------------------------------------------------------
+
+lmoran <- localmoran(
+  datos_moran$log_price,
+  listw = W_knn_8,
+  zero.policy = TRUE
+)
+
+# Lo pasamos al objeto sf
+datos_moran$Ii      <- lmoran[, 1]
+datos_moran$E.Ii    <- lmoran[, 2]
+datos_moran$Var.Ii  <- lmoran[, 3]
+datos_moran$Z.Ii    <- lmoran[, 4]
+datos_moran$p.Ii    <- lmoran[, 5]
+
+# Variables centradas para clasificar cuadrantes
+media_y  <- mean(datos_moran$log_price, na.rm = TRUE)
+media_Wy <- mean(datos_moran$log_price_W, na.rm = TRUE)
+
+datos_moran <- datos_moran |>
+  mutate(
+    lisa_cluster = case_when(
+      p.Ii >= 0.05 ~ "No significativo",
+      log_price >= media_y  & log_price_W >= media_Wy ~ "Alto-Alto",
+      log_price <  media_y  & log_price_W <  media_Wy ~ "Bajo-Bajo",
+      log_price >= media_y  & log_price_W <  media_Wy ~ "Alto-Bajo",
+      log_price <  media_y  & log_price_W >= media_Wy ~ "Bajo-Alto",
+      TRUE ~ "No significativo"
+    )
+  )
+
+# Mapa LISA
+tmap_mode("plot")
+
+datos_lisa_plot <- datos_moran |>
+  st_transform(3857)
+
+tm_shape(datos_lisa_plot) +
+  tm_basemap("CartoDB.Positron") +
+  tm_dots(
+    col = "lisa_cluster",
+    size = 0.15,
+    palette = c(
+      "Alto-Alto" = "red",
+      "Bajo-Bajo" = "blue",
+      "Alto-Bajo" = "orange",
+      "Bajo-Alto" = "lightblue",
+      "No significativo" = "grey80"
+    ),
+    title = "LISA"
+  ) +
+  tm_layout(
+    title = "Clusters espaciales del precio de la vivienda - I de Moran local",
+    legend.outside = TRUE,
+    frame = FALSE
+  )
+```
+
+El mapa LISA permite identificar clústeres espaciales significativos del precio de la vivienda. Las zonas Alto-Alto representan áreas donde las viviendas con precios elevados se localizan cerca de otras viviendas también caras, mientras que las zonas Bajo-Bajo indican concentración de viviendas con precios bajos. Las categorías Alto-Bajo y Bajo-Alto recogen posibles valores atípicos espaciales. Las celdas no significativas se representan en gris, ya que no muestran evidencia estadística de asociación espacial local.
+
+La existencia de clústeres espaciales confirma que el precio de la vivienda no se distribuye aleatoriamente en el espacio, por lo que resulta necesario tener en cuenta la localización en la modelización posterior.
+
+
+

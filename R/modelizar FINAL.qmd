@@ -1,0 +1,3015 @@
+---
+title: "TRABAJO_FINAL"
+format: 
+  html:
+    theme: united
+    embed-resources: true
+    toc: true
+    toc-location: right
+    toc-title: Índice
+    toc-depth: 10
+editor: visual
+author: Cristina Martinez, Laura López, Veronica Yebra, Marina Parra
+---
+
+# 0. Carga de librerias y datos
+
+```{r}
+rm(list = ls())
+
+set.seed(1234)
+
+options(
+  scipen = 999,
+  dplyr.summarise.inform = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(broom)
+library(patchwork)
+library(viridisLite)
+
+library(skimr)
+library(psych)
+library(naniar)
+library(mice)
+library(VIM)
+library(corrplot)
+
+library(sf)
+library(spdep)
+library(spatialreg)
+library(gstat)
+library(automap)
+library(terra)
+library(stars)
+library(tmap)
+
+library(tidymodels)
+library(parsnip)
+library(recipes)
+library(workflows)
+library(yardstick)
+library(rsample)
+
+library(ranger)
+library(lightgbm)
+library(xgboost)
+library(gbm)
+library(kernlab)
+library(kknn)
+library(nnet)
+```
+
+```{r}
+datos <- readRDS("./datos_depurados.rds")
+head(datos)
+```
+
+Convertimos los datos a objeto espacial para poder trabajar con ellos
+
+```{r}
+datos_sf <- datos |>
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  ) |>
+  st_transform(25830)
+```
+
+```{r}
+# Comprobaciones del objeto espacial
+class(datos_sf)
+st_crs(datos_sf)
+head(st_coordinates(datos_sf))
+summary(st_coordinates(datos_sf)[, 1])
+summary(st_coordinates(datos_sf)[, 2])
+```
+
+> Las coordenadas originales se han transformado a EPSG:25830, un sistema proyectado en metros. Esto permite definir vecindarios espaciales usando radios métricos, como 500 metros.
+
+# 1. Dividimos en train y test
+
+Dividimos el datatset en train y test para posteriormente evaluar la capacidad predictiva de los modelos.
+
+```{r}
+set.seed(1234)
+
+datos_split <- initial_split(
+  datos_sf,
+  prop = 0.8,
+  strata = log_precio_m2
+)
+
+datos_train <- training(datos_split)
+datos_test  <- testing(datos_split)
+
+nrow(datos_train)
+nrow(datos_test)
+```
+
+> 7910 observaciones para train (80%)
+
+> 1978 observaciones para evaluar
+
+## Validación espacial
+
+Vamos a utilizar una validacion aleatoria train-test, ya que nuestro objetivo es modelizar el precio de la vivienda dentro de zonas donde existen observaciones cercanas. Esto nos ayuda a predecir el precio de una vivienda nueva a partir de sus características y de su información espacial. Asi podemos comprobar el rendimiento de los modelos cuando las viviendas a predecir se encuentran dentro de la misma ventana espacial que las observaciones utilizadas en el entrenamiento. Es por ello que nos interesa que el conjunto de entrenamiento mantenga una distribución suficientemente densa dentro del área de validación, de forma que las predicciones puedan apoyarse en testigos cercanos.
+
+Vamos a ver la distribución espacial de las observaciones de entrenamiento y test para comprobar que la partición aleatoria mantiene cobertura espacial en el ámbito de estudio.
+
+```{r}
+datos_train_osm <- datos_train |>
+  st_transform(4326) |>
+  mutate(muestra = "Train")
+
+datos_test_osm <- datos_test |>
+  st_transform(4326) |>
+  mutate(muestra = "Test")
+
+tmap_mode("plot")
+
+mapa_train_test <- 
+  tm_shape(datos_train_osm) +
+  tm_basemap("OpenStreetMap") +
+  tm_dots(
+    col = "#00BFC4",
+    size = 0.25,
+    alpha = 0.6) +
+  tm_shape(datos_test_osm) +
+  tm_dots(
+    col = "#F8766D",
+    size = 0.25,
+    alpha = 0.85) +
+  tm_add_legend(
+    type = "symbol",
+    labels = c("Train", "Test"),
+    col = c("#00BFC4", "#F8766D"),
+    title = "Muestra") +
+  tm_title(
+    "Distribución espacial de las muestras de entrenamiento y validación",
+    fontface = "bold") +
+  tm_layout(
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    legend.outside.size = 0.12,
+    legend.text.size = 0.5,
+    legend.title.size = 0.7,
+    inner.margins = c(0, 0, 0, 0),
+    outer.margins = c(0, 0, 0, 0),
+    asp = 0,
+    frame = FALSE)
+
+mapa_train_test
+```
+
+> Con este mapa vemos que tanto las observaciones de entrenamiento como de test estan distribuidas de forma bastante similar en el espacio. Esto es lo que queriamos conseguir usando validacion espacial, de esta forma el conjunto test no queda aislado ni concentrado en una única zona, sino que se encuentra dentro del área cubierta por las observaciones de entrenamiento y podemos evaluar los modelos adecuadamente ya que tienen observaciones cercanas que pertenecen a train.
+
+# 2. Matriz de pesos espaciales
+
+Contruimos una matriz de pesos espaciales para el conjunto de entrenamiento.
+
+Buscamos para cada vivienda qué otras viviendas están dentro de un radio de 500 metros. Utilizamos un radio de 500 metros porque representa un entorno urbano próximo. Las viviendas situadas a esta distancia pueden compartir características de localización, servicios, accesibilidad y entorno residencial.
+
+```{r}
+# Coordenadas del conjunto de entrenamiento
+coords <- st_coordinates(datos_train)
+
+# Vecinos dentro de 500 metros
+list.dist500 <- dnearneigh(
+  coords,
+  d1 = 0,
+  d2 = 500)
+
+summary(list.dist500)
+```
+
+La matriz de pesos se construye únicamente con las observaciones de entrenamiento para evitar que la información del conjunto de test intervenga en la fase de ajuste del modelo.
+
+```{r}
+# Número de vecinos
+hist(
+  card(list.dist500),
+  main = "Número de vecinos por vivienda",
+  xlab = "Número de vecinos"
+)
+```
+
+> Con este histograma podemos ver si el radio elegido es demasiado restrictivo o demasiado amplio. Si muchas viviendas no tuvieran vecinos, el radio sería insuficiente para construir retardos espaciales estables. Sin embargo, observamos que la distribucion es heterogénea, lo que tiene sentido por la densidad residencial del area de estudio.
+
+```{r}
+# Comprobar si hay viviendas sin vecinos
+table(card(list.dist500) == 0)
+```
+
+> Con un radio de 500 metros, prácticamente todas las viviendas del conjunto de entrenamiento tienen al menos un vecino: únicamente una observación queda aislada. Por tanto, el radio elegido permite construir una matriz de pesos espaciales suficientemente conectada sin recurrir a vecindarios excesivamente amplios.
+
+Ahora si, hacemos la matriz transformando las distancias entre cada vivienda y sus vecinos en pesos inversos al cuadrado:
+
+```{r}
+# Distancias entre vecinos
+distancias <- nbdists(
+  list.dist500,
+  coords)
+
+# Comprobamos si hay distancias cero
+sum(unlist(distancias) == 0)
+
+# Evitamos pesos infinitos en caso de viviendas con la misma coordenada
+distancias <- lapply(distancias, function(x) {
+  x[x == 0] <- 1
+  x})
+
+# Pesos inversos al cuadrado
+pesos_inv2 <- lapply(distancias, function(x) {
+  1 / (x^2)})
+
+# Matriz de pesos espaciales
+W_dist <- nb2listw(
+  list.dist500,
+  glist = pesos_inv2,
+  style = "W",
+  zero.policy = TRUE) # por la observacion aisalda
+```
+
+> Con la matriz espacial reunimos informacion espacial del entorno de cada vivienda y asi podemos utilizarla en los modelos con componente espacial.
+
+Representamos el radio para verlo visualmente.
+
+```{r}
+# Muestra de viviendas para visualizar el radio de vecindad
+set.seed(123)
+
+idx_muestra_vecinos <- sample(seq_len(nrow(datos_train)), 25)
+
+puntos_muestra <- datos_train[idx_muestra_vecinos, ]
+
+# Círculos de 500 metros alrededor de las viviendas seleccionadas
+buffers_muestra <- st_buffer(puntos_muestra, dist = 500)
+
+# Pasamos a coordenadas geográficas para OSM
+datos_train_osm <- datos_train |>
+  st_transform(4326)
+
+puntos_muestra_osm <- puntos_muestra |>
+  st_transform(4326)
+
+buffers_muestra_osm <- buffers_muestra |>
+  st_transform(4326)
+```
+
+```{r}
+tmap_mode("plot")
+tm_shape(datos_train_osm) +
+  tm_tiles("OpenStreetMap") +
+  tm_dots(
+    fill = "grey40",
+    size = 0.20,
+    fill_alpha = 0.45,
+    col = NA) +
+  tm_shape(buffers_muestra_osm) +
+  tm_borders(
+    col = "red",
+    lwd = 1.5) +
+  tm_shape(puntos_muestra_osm) +
+  tm_dots(
+    fill = "black",
+    size = 0.25,
+    fill_alpha = 1,
+    col = NA) +
+  tm_title(
+    "Radio de vecindad espacial de 500 metros",
+    fontface = "bold") +
+  tm_layout(
+    legend.show = FALSE,
+    frame = FALSE,
+    inner.margins = c(0, 0, 0, 0),
+    outer.margins = c(0, 0, 0, 0),
+    asp = 0)
+```
+
+> Con este mapa observamos el radio de 500 metros (el circulo rojo) y vemos que, especialmente en las zonas más densas, las viviendas cuentan con suficientes observaciones cercanas para construir la matriz de pesos espaciales.
+
+# 3. I de Morgan
+
+> ¿El precio por m² presenta autocorrelación espacial en el conjunto de entrenamiento?
+
+Como ya tenemos la matriz de pesos espaciales `W_dist`, vamos a comprobar si la variable que vamos a modelizar `log_precio_m2` presenta **autocorrelacion espacial** en el conjunto de entrenamiento.
+
+Vamos a medir si el logaritmo del precio por metro cuadrado de cada vivienda está relacionado con el precio de las viviendas situadas en su entorno de 500 metros. El objetivo es comprobar si existe autocorrelación espacial en la variable dependiente, es decir, si las viviendas próximas tienden a presentar valores similares de precio.
+
+La hipótesis nula del contraste de Moran es la ausencia de autocorrelación espacial. Por tanto, un valor positivo y significativo de la I de Moran indicaría que viviendas próximas tienden a presentar precios por metro cuadrado similares.
+
+```{r}
+# I de Moran global
+moran_global <- moran.test(
+  datos_train$log_precio_m2,
+  listw = W_dist,
+  zero.policy = TRUE,
+  alternative = "greater",
+  na.action = na.omit
+)
+
+moran_global
+```
+
+> El contraste de Moran rechaza claramente la hipótesis nula de independencia espacial. El estadístico I de Moran es positivo y elevado (`I = 0.528`), con un p-valor prácticamente nulo, por lo que existe evidencia de autocorrelación espacial positiva en el logaritmo del precio por metro cuadrado.
+
+> Esto significa que las viviendas próximas tienden a presentar precios por metro cuadrado similares: viviendas caras cerca de otras viviendas caras y viviendas más baratas cerca de viviendas más baratas. Por tanto, la variable objetivo presenta dependencia espacial inicial, lo que justifica analizar si los modelos predictivos son capaces de absorber esa estructura o si es necesario incorporar explícitamente información espacial.
+
+Lo vemos graficamente y calculamos el retardo espacial.
+
+```{r}
+# Retardo espacial
+datos_train$log_precio_m2_w <- lag.listw(
+  W_dist,
+  var = datos_train$log_precio_m2,
+  zero.policy = TRUE)
+
+# Comprobación del retardo espacial
+sum(is.na(datos_train$log_precio_m2_w))
+summary(datos_train$log_precio_m2_w)
+
+datos_moran_plot <- datos_train |>
+  filter(log_precio_m2_w != 0) # quitamos la vivienda aislada
+
+ggplot(
+  datos_moran_plot,
+  aes(x = log_precio_m2, y = log_precio_m2_w)) +
+  geom_point(
+    color = "black",
+    alpha = 0.35,
+    size = 0.7) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "red",
+    linewidth = 1.2) +
+  labs(
+    title = "Gráfico de Moran",
+    x = "log(precio por m²)",
+    y = "Retardo espacial de log(precio por m²)") +
+  theme_minimal(base_size = 13)
+```
+
+> Observamos una clara relacion positiva entre el logaritmo del precio por metro cuadrado de cada vivienda y su retardo espacial, es decir, que las viviendas con precios caros estan cerca de otras viviendas caras, y las viviendas con precios mas bajos se rodean de otras viviendas con menor precio. Es por ello que vamos a incorporar en nuestros modelos las componentes espaciales para mejorar la capacidad predictiva y la dependencia espacial detectada.
+
+## Correlograma
+
+## Ventana de prediccion
+
+Definimos la ventana de prediccion.La idea es definir el área dentro de la cual tiene sentido hacer predicciones, es decir, la zona donde el modelo tiene suficientes datos de entrenamiento alrededor. Para predecir precios 'como tasador' necesitamos que las viviendas nuevas/test estén dentro de una zona con suficientes “testigos” o viviendas observadas alrededor. La ventana debe construirse con `datos_train`.
+
+```{r}
+# Ventana de predicción basada en el conjunto de entrenamiento
+ventana_prediccion <- datos_train |>
+  st_geometry() |>
+  st_union() |>
+  st_buffer(500) |>
+  st_union()
+
+# Comprobamos qué observaciones de test caen dentro de la ventana
+test_dentro_ventana <- st_within(
+  datos_test,
+  ventana_prediccion,
+  sparse = FALSE
+)[, 1]
+
+table(test_dentro_ventana)
+```
+
+Todas las viviendas de test están dentro de la ventana de predicción construida desde train.
+
+```{r}
+datos_test$test_dentro_ventana <- test_dentro_ventana
+
+ggplot() +
+  geom_sf(data = st_as_sf(ventana_prediccion), fill = "grey80", alpha = 0.4) +
+  geom_sf(data = datos_train, size = 0.4, alpha = 0.4) +
+  geom_sf(data = datos_test, aes(color = test_dentro_ventana), size = 0.7) +
+  labs(
+    title = "Ventana de predicción basada en el conjunto de entrenamiento",
+    color = "Test dentro\nde la ventana"
+  ) +
+  theme_minimal()
+```
+
+> Todas las observaciones del conjunto de test se encuentran dentro de la ventana de predicción construida a partir del conjunto de entrenamiento. Esto indica que el conjunto de entrenamiento proporciona cobertura espacial suficiente para evaluar modelos basados en proximidad espacial.
+
+# 4. Modelos sin dependencia espacial explícita
+
+Antes de estimar los modelos predictivos hacemos una base de datos sin geometría, ya que los algoritmos utilizados en esta sección trabajan con variables tabulares. Vamos a eliminar las coordenadas (`longitude` y `latitude`), la variable `cluster_dbscan` y el retardo espacial del precio, en caso de estar creado.
+
+Queremos construir una primera familia de modelos que no utilicen información espacial explícita. Por lo que dejamos las características propias de la vivienda y algunas variables de entorno disponibles en la base de datos, como criminalidad, composición demográfica o proximidad a zonas comerciales/históricas, porque forman parte de la información observable asociada a cada vivienda.
+
+Estos modelos servirán como referencia para comparar posteriormente si la incorporación explícita de información espacial mejora la capacidad predictiva.
+
+```{r}
+datos_train_mod <- datos_train |>
+  st_drop_geometry() |>
+  select(
+    -any_of(c(
+      "longitude",
+      "latitude",
+      "cluster_dbscan",
+      "precio_m2", "house.price", "precio_actualizado", "log_precio_m2_w")))
+
+datos_test_mod <- datos_test |>
+  st_drop_geometry() |>
+  select(
+    -any_of(c(
+      "longitude",
+      "latitude",
+      "cluster_dbscan",
+      "precio_m2", "house.price", "precio_actualizado", "log_precio_m2_w")))
+```
+
+```{r}
+rec_base <- recipe(
+  log_precio_m2 ~ .,
+  data = datos_train_mod
+) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+```
+
+## 1. Modelo lineal (LM)
+
+Entrenamos los datos en train
+
+```{r}
+lm_mod <- linear_reg() |>
+  set_engine("lm")
+
+# workflow
+lm_wf <- workflow() |>
+  add_recipe(rec_base) |>
+  add_model(lm_mod)
+
+# ajustar modelo
+lm_fit <- fit(
+  lm_wf,
+  data = datos_train_mod)
+
+# coeficientes
+lm_fit |>
+  extract_fit_parsnip() |>
+  tidy()
+```
+
+Las predicciones son sobre el conjunto de datos test.
+
+```{r}
+pred_lm <- predict(
+  lm_fit,
+  new_data = datos_test_mod) |>
+  bind_cols(datos_test_mod |> select(log_precio_m2)) |>
+  mutate(
+    modelo = "Lineal",
+    residuo = log_precio_m2 - .pred)
+
+# metricas
+metricas_lm <- tibble(
+  Modelo = "Lineal",
+  RMSE = rmse(pred_lm, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_lm, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_lm, truth = log_precio_m2, estimate = .pred)$.estimate)
+metricas_lm
+```
+
+> El modelo lineal obtiene un R² de 0.486, por lo que explica aproximadamente el 48,6% de la variabilidad del logaritmo del precio por metro cuadrado en el conjunto de test. Su RMSE es de 0.238 y su MAE de 0.183.
+
+> Estos resultados indican que el modelo lineal tiene una capacidad predictiva moderada, pero limitada. Esto sugiere que la relación entre las características de la vivienda y el precio por metro cuadrado no es completamente lineal.
+
+## 2. RandomForest
+
+```{r}
+# definir modelo
+rf_mod <- rand_forest(
+  trees = 500) |>
+  set_engine("ranger") |>
+  set_mode("regression")
+
+# workflow
+rf_wf <- workflow() |>
+  add_recipe(rec_base) |>
+  add_model(rf_mod)
+
+# ajustar modelo
+rf_fit <- fit(
+  rf_wf,
+  data = datos_train_mod)
+
+# predicciones de test
+pred_rf <- predict(
+  rf_fit,
+  datos_test_mod) |>
+  bind_cols(
+    datos_test_mod |>
+      select(log_precio_m2)) |>
+  mutate(
+    modelo = "Random Forest",
+    residuo = log_precio_m2 - .pred)
+
+# metricas
+
+metricas_rf <- tibble(
+  Modelo = "Random Forest",
+  RMSE = rmse(pred_rf, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_rf, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_rf, truth = log_precio_m2, estimate = .pred)$.estimate)
+
+metricas_rf
+```
+
+> El modelo Random Forest obtiene un R² de 0.653, por lo que explica aproximadamente el 65,3% de la variabilidad del logaritmo del precio por metro cuadrado en test. Su RMSE es de 0.197 y su MAE de 0.143.
+
+> En comparación con el modelo lineal, el Random Forest mejora claramente la capacidad predictiva, ya que aumenta el R² y reduce tanto el RMSE como el MAE. Esto indica que un modelo no lineal basado en árboles capta mejor las relaciones entre las variables explicativas y el precio de la vivienda.
+
+## 3. LightGBM
+
+```{r}
+rec_lgbm <- recipe(
+  log_precio_m2 ~ .,
+  data = datos_train_mod
+) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+# entrenar recipe
+prep_lgbm <- prep(rec_lgbm)
+
+
+# bake
+train_baked <- bake(
+  prep_lgbm,
+  new_data = NULL)
+
+test_baked <- bake(
+  prep_lgbm,
+  new_data = datos_test_mod)
+
+# matrices 
+x_train <- train_baked |>
+  select(-log_precio_m2) |>
+  as.matrix()
+
+y_train <- train_baked$log_precio_m2
+
+
+x_test <- test_baked |>
+  select(-log_precio_m2) |>
+  as.matrix()
+
+y_test <- test_baked$log_precio_m2
+
+# datasets light
+dtrain <- lgb.Dataset(
+  data = x_train,
+  label = y_train)
+
+dtest <- lgb.Dataset(
+  data = x_test,
+  label = y_test)
+
+modelo_lgbm <- lgb.train(
+  params = list(
+    objective = "regression",
+    metric = "rmse",
+    learning_rate = 0.05,
+    num_leaves = 31,
+    feature_fraction = 0.8),
+ data = dtrain,
+ nrounds = 500)
+
+# predicciones sobre test
+pred_lgbm <- predict(
+  modelo_lgbm,
+  x_test
+)
+
+pred_lgbm_df <- tibble(
+  log_precio_m2 = y_test,
+  .pred = pred_lgbm,
+  modelo = "LightGBM",
+  residuo = log_precio_m2 - .pred)
+
+# metricas
+metricas_lgbm <- tibble(
+  Modelo = "LightGBM",
+  RMSE = rmse(pred_lgbm_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_lgbm_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_lgbm_df, truth = log_precio_m2, estimate = .pred)$.estimate)
+
+metricas_lgbm
+```
+
+> El modelo LightGBM obtiene un R² de 0.657, por lo que explica aproximadamente el 65,7% de la variabilidad del logaritmo del precio por metro cuadrado en test. Su RMSE es de 0.195 y su MAE de 0.142.
+
+> Este modelo presenta el mejor resultado dentro de esta primera familia de modelos, aunque la mejora respecto al Random Forest es pequeña. En concreto, obtiene un R² ligeramente superior y unos errores algo menores, por lo que puede considerarse el modelo con mejor rendimiento predictivo entre los modelos sin dependencia espacial explícita.
+
+## 4. SVM
+
+```{r}
+svr_mod <- svm_rbf(
+  cost = 1,
+  rbf_sigma = 0.1
+) |>
+  set_engine("kernlab") |>
+  set_mode("regression")
+
+# workflow
+svr_wf <- workflow() |>
+  add_recipe(rec_base) |>
+  add_model(svr_mod)
+
+# ajustar modelo
+svr_fit <- fit(
+  svr_wf,
+  data = datos_train_mod)
+
+# predicciones test
+pred_svr <- predict(
+  svr_fit,
+  datos_test_mod) |>
+
+  bind_cols(
+    datos_test_mod |>
+      select(log_precio_m2)) |>
+  mutate(
+    modelo = "SVR",
+    residuo = log_precio_m2 - .pred)
+
+# metricas
+metricas_svr <- tibble(
+  Modelo = "SVM",
+  RMSE = rmse(pred_svr, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_svr, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_svr, truth = log_precio_m2, estimate = .pred)$.estimate)
+metricas_svr
+```
+
+> El modelo SVM obtiene un R² de 0.608, por lo que explica aproximadamente el 60,8% de la variabilidad del logaritmo del precio por metro cuadrado en test. Su RMSE es de 0.208 y su MAE de 0.153.
+
+> El SVM mejora claramente al modelo lineal, pero queda por debajo de los modelos basados en árboles, como Random Forest y LightGBM. Esto indica que captura cierta no linealidad en los datos, aunque en este caso no alcanza el rendimiento de los métodos ensemble.
+
+## 5. KNN
+
+```{r}
+# definir modelo
+
+knn_mod <- nearest_neighbor(
+  neighbors = 5
+) |>
+  set_engine("kknn") |>
+  set_mode("regression")
+
+# workflow
+knn_wf <- workflow() |>
+  add_recipe(rec_base) |>
+  add_model(knn_mod)
+
+# ajustar modelo
+knn_fit <- fit(
+  knn_wf,
+  data = datos_train_mod)
+
+# predicciones sobre test
+pred_knn <- predict(
+  knn_fit,
+  datos_test_mod) |>
+
+  bind_cols(
+    datos_test_mod |>
+      select(log_precio_m2)) |>
+
+  mutate(
+    modelo = "KNN",
+    residuo = log_precio_m2 - .pred)
+
+# metricas 
+metricas_knn <- tibble(
+  Modelo = "KNN",
+  RMSE = rmse(pred_knn, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_knn, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_knn, truth = log_precio_m2, estimate = .pred)$.estimate)
+metricas_knn
+```
+
+> El modelo KNN obtiene un R² de 0.523, por lo que explica aproximadamente el 52,3% de la variabilidad del logaritmo del precio por metro cuadrado en test. Su RMSE es de 0.232 y su MAE de 0.170.
+
+> El KNN mejora ligeramente al modelo lineal en términos de R² y RMSE, pero la mejora es reducida. Además, presenta errores superiores a los de Random Forest, LightGBM, SVM y Gradient Boosting, por lo que no parece ser una de las alternativas más competitivas en este caso.
+
+## 6. GradientBoosting
+
+```{r}
+# =========================================================
+# PREPROCESADO CON EL MISMO RECIPE QUE EL RESTO DE MODELOS
+# =========================================================
+
+prep_base <- prep(rec_base)
+
+train_gbm <- bake(
+  prep_base,
+  new_data = NULL
+)
+
+test_gbm <- bake(
+  prep_base,
+  new_data = datos_test_mod
+)
+
+
+# =========================================================
+# MODELO GRADIENT BOOSTING
+# =========================================================
+
+set.seed(123)
+
+modelo_gbm <- gbm(
+  formula = log_precio_m2 ~ .,
+  data = train_gbm,
+  distribution = "gaussian",
+  n.trees = 500,
+  interaction.depth = 4,
+  shrinkage = 0.05,
+  n.minobsinnode = 10,
+  cv.folds = 5,
+  verbose = FALSE)
+
+
+# =========================================================
+# MEJOR NÚMERO DE ÁRBOLES SEGÚN VALIDACIÓN CRUZADA
+# =========================================================
+
+best_iter <- gbm.perf(
+  modelo_gbm,
+  method = "cv",
+  plot.it = FALSE)
+
+best_iter
+
+
+# =========================================================
+# PREDICCIONES SOBRE TEST
+# =========================================================
+
+pred_gbm <- predict(
+  modelo_gbm,
+  newdata = test_gbm,
+  n.trees = best_iter)
+
+
+# =========================================================
+# DATAFRAME DE RESULTADOS
+# =========================================================
+
+pred_gbm_df <- tibble(
+  log_precio_m2 = test_gbm$log_precio_m2,
+  .pred = pred_gbm,
+  modelo = "Gradient Boosting",
+  residuo = log_precio_m2 - .pred)
+
+
+# =========================================================
+# MÉTRICAS
+# =========================================================
+
+metricas_gbm <- tibble(
+  Modelo = "Gradient Boosting",
+  RMSE = rmse(
+    pred_gbm_df,
+    truth = log_precio_m2,
+    estimate = .pred
+  )$.estimate,
+  MAE = mae(
+    pred_gbm_df,
+    truth = log_precio_m2,
+    estimate = .pred
+  )$.estimate,
+  R2 = rsq(
+    pred_gbm_df,
+    truth = log_precio_m2,
+    estimate = .pred
+  )$.estimate
+)
+
+metricas_gbm
+```
+
+> El modelo Gradient Boosting obtiene un R² de 0.625, por lo que explica aproximadamente el 62,5% de la variabilidad del logaritmo del precio por metro cuadrado en test. Su RMSE es de 0.204 y su MAE de 0.151.
+
+> Este modelo mejora al modelo lineal, al KNN y al SVM en términos de R² y RMSE, aunque queda por debajo de Random Forest y LightGBM. Por tanto, dentro de los modelos sin dependencia espacial explícita, ofrece un rendimiento intermedio-alto, pero no es el mejor modelo de esta familia.
+
+## Comparacion de modelos sin espacialidad
+
+Comparamos todas las metricas de los modelos que no tienen espacialidad para ver cual es le mejor.
+
+```{r}
+metricas_no_espacial <- bind_rows(
+  metricas_lm,
+  metricas_rf,
+  metricas_lgbm,
+  metricas_svr,
+  metricas_knn,
+  metricas_gbm
+) |>
+  arrange(RMSE)
+
+metricas_no_espacial
+```
+
+> El mejor modelo sin componente espacial es **LightGBM**, porque es el que tiene un RMSE más bajo, MAE más bajo y R² más alto. Es decir, es el modelo que comete menos error medio en test y, además, el que explica mayor proporción de la variabilidad del `log_precio_m2`.
+
+# 5. Residuos de los modelos
+
+Una vez hemos estimado los modelos sin componente espacial nos calculamos la I de Moran sobre sus residuos con el objetivo de comprobar si los errores mantenían autocorrelación espacial
+
+Este análisis se realiza sobre `train` porque la matriz de pesos `W_dist` se ha construido únicamente con las observaciones de entrenamiento. Por tanto, los resultados deben interpretarse como un diagnóstico de autocorrelación espacial residual del ajuste, no como una métrica predictiva out-of-sample.
+
+```{r}
+# =========================================================
+# RESIDUOS EN TRAIN DE LOS MODELOS SIN DEPENDENCIA ESPACIAL EXPLÍCITA
+# =========================================================
+
+# LM
+pred_lm_train <- predict(
+  lm_fit,
+  new_data = datos_train_mod)
+
+datos_train$res_lm <- datos_train_mod$log_precio_m2 - pred_lm_train$.pred
+
+
+# Random Forest
+pred_rf_train <- predict(
+  rf_fit,
+  new_data = datos_train_mod)
+
+datos_train$res_rf <- datos_train_mod$log_precio_m2 - pred_rf_train$.pred
+
+
+# LightGBM
+pred_lgbm_train <- predict(
+  modelo_lgbm,
+  x_train)
+
+datos_train$res_lgbm <- y_train - pred_lgbm_train
+
+
+# SVM
+pred_svr_train <- predict(
+  svr_fit,
+  new_data = datos_train_mod)
+
+datos_train$res_svr <- datos_train_mod$log_precio_m2 - pred_svr_train$.pred
+
+
+# KNN
+pred_knn_train <- predict(
+  knn_fit,
+  new_data = datos_train_mod)
+
+datos_train$res_knn <- datos_train_mod$log_precio_m2 - pred_knn_train$.pred
+
+
+# Gradient Boosting
+pred_gbm_train <- predict(
+  modelo_gbm,
+  newdata = train_gbm,
+  n.trees = best_iter)
+
+datos_train$res_gbm <- train_gbm$log_precio_m2 - pred_gbm_train
+```
+
+```{r}
+# =========================================================
+# I DE MORAN SOBRE LOS RESIDUOS
+# =========================================================
+
+moran_lm <- moran.test(
+  datos_train$res_lm,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+
+moran_rf <- moran.test(
+  datos_train$res_rf,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+
+moran_lgbm <- moran.test(
+  datos_train$res_lgbm,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+
+moran_svr <- moran.test(
+  datos_train$res_svr,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+
+moran_knn <- moran.test(
+  datos_train$res_knn,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+
+moran_gbm <- moran.test(
+  datos_train$res_gbm,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+```
+
+> Los contrastes de Moran sobre los residuos muestran si los errores de cada modelo siguen organizándose espacialmente. En todos los casos, un valor positivo y significativo indica que los residuos no se distribuyen aleatoriamente en el espacio, sino que tienden a agruparse territorialmente.
+
+```{r}
+# =========================================================
+# TABLA RESUMEN DE MORAN SOBRE RESIDUOS
+# =========================================================
+
+moran_residuos <- tibble(
+  Modelo = c(
+    "Lineal",
+    "Random Forest",
+    "LightGBM",
+    "SVM",
+    "KNN",
+    "Gradient Boosting"
+  ),
+  I_Moran = c(
+    moran_lm$estimate[["Moran I statistic"]],
+    moran_rf$estimate[["Moran I statistic"]],
+    moran_lgbm$estimate[["Moran I statistic"]],
+    moran_svr$estimate[["Moran I statistic"]],
+    moran_knn$estimate[["Moran I statistic"]],
+    moran_gbm$estimate[["Moran I statistic"]]
+  ),
+  p_value = c(
+    moran_lm$p.value,
+    moran_rf$p.value,
+    moran_lgbm$p.value,
+    moran_svr$p.value,
+    moran_knn$p.value,
+    moran_gbm$p.value
+  )
+) |>
+  mutate(
+    significativo = if_else(p_value < 0.05, "Sí", "No")
+  ) |>
+  arrange(desc(I_Moran))
+
+moran_residuos
+```
+
+> Los resultados muestran que los residuos de los modelos sin dependencia espacial explícita mantienen autocorrelación espacial positiva. Por tanto, aunque los modelos predictivos captan parte de la variabilidad del precio por metro cuadrado, todavía queda una estructura espacial residual que no está completamente explicada por las variables incluidas.
+
+> El modelo lineal presenta la mayor autocorrelación espacial residual, lo que sugiere que su especificación es insuficiente para capturar la estructura territorial del precio. Los modelos más flexibles, especialmente los basados en árboles, reducen esta dependencia residual, pero no la eliminan por completo. LightGBM es el que tiene un menor valor en la I de Morgan.
+
+# 6. Modelos con componente espacial
+
+En este apartado se estiman versiones de los modelos anteriores incorporando explícitamente información espacial mediante el retardo espacial del precio. Este retardo representa, para cada vivienda, el precio medio ponderado de las viviendas cercanas.
+
+La idea es comprobar si añadir esta información espacial mejora la capacidad predictiva y reduce la autocorrelación espacial residual detectada en los modelos anteriores.
+
+Es importante distinguir entre el retardo espacial en `train` y en `test`. En `train`, el retardo se calcula usando la matriz de pesos entre viviendas de entrenamiento. En `test`, el retardo debe calcularse usando únicamente viviendas de `train` cercanas, ya que no se puede utilizar el precio observado de las viviendas de test para construir una variable predictora.
+
+-   **RETARDO ESPACIAL EN TRAIN**
+
+```{r}
+datos_train$log_precio_m2_w <- lag.listw(
+  W_dist,
+  var = datos_train$log_precio_m2,
+  zero.policy = TRUE
+)
+
+summary(datos_train$log_precio_m2_w)
+sum(is.na(datos_train$log_precio_m2_w))
+sum(datos_train$log_precio_m2_w == 0)
+```
+
+El 0 viene de la vivienda de train sin vecinos y no es grave.
+
+-   **RETARDO ESPACIAL EN TEST** Ahora cada vivienda de test recibe un retardo espacial calculado con precios observados de viviendas de train cercanas.
+
+```{r}
+# retardo espacial en test usando los vecinos de train
+
+calcular_lag_test_train <- function(datos_test, datos_train, variable, radio = 500, potencia = 2) {
+  
+  vecinos_test_train <- sf::st_is_within_distance(
+    datos_test,
+    datos_train,
+    dist = radio
+  )
+  
+  valores_train <- datos_train[[variable]]
+  
+  lag_test <- purrr::map2_dbl(
+    vecinos_test_train,
+    seq_along(vecinos_test_train),
+    function(vecinos, i) {
+      
+      if (length(vecinos) == 0) {
+        return(NA_real_)
+      }
+      
+      distancias <- as.numeric(
+        sf::st_distance(
+          datos_test[i, ],
+          datos_train[vecinos, ],
+          by_element = FALSE
+        )
+      )
+      
+      distancias[distancias == 0] <- 1
+      
+      pesos <- 1 / (distancias ^ potencia)
+      
+      sum(valores_train[vecinos] * pesos, na.rm = TRUE) /
+        sum(pesos, na.rm = TRUE)
+    }
+  )
+  
+  return(lag_test)
+}
+
+
+datos_test$log_precio_m2_w <- calcular_lag_test_train(
+  datos_test = datos_test,
+  datos_train = datos_train,
+  variable = "log_precio_m2",
+  radio = 500,
+  potencia = 2
+)
+
+summary(datos_test$log_precio_m2_w)
+sum(is.na(datos_test$log_precio_m2_w))
+```
+
+-   **Datasets espacializados limpios**
+
+Aqui si dejamos `log_precio_m2_w`. Esa es la diferencia respecto a los modelos sin dependencia espacial explícita.
+
+```{r}
+datos_train_sp <- datos_train |>
+  st_drop_geometry() |>
+  select(
+    -any_of(c(
+      "X",
+      "longitude",
+      "latitude",
+      "cluster_dbscan",
+      "precio_m2",
+      "house.price",
+      "precio_actualizado",
+      "res_lm",
+      "res_rf",
+      "res_lgbm",
+      "res_svr",
+      "res_knn",
+      "res_gbm",
+      "res_sar",
+      "res_rf_sp",
+      "res_lgbm_sp",
+      "res_svr_sp",
+      "res_knn_sp",
+      "res_gbm_sp"
+    ))
+  )
+
+datos_test_sp <- datos_test |>
+  st_drop_geometry() |>
+  select(
+    -any_of(c(
+      "X",
+      "longitude",
+      "latitude",
+      "cluster_dbscan",
+      "precio_m2",
+      "house.price",
+      "precio_actualizado",
+      "res_lm",
+      "res_rf",
+      "res_lgbm",
+      "res_svr",
+      "res_knn",
+      "res_gbm",
+      "res_sar",
+      "res_rf_sp",
+      "res_lgbm_sp",
+      "res_svr_sp",
+      "res_knn_sp",
+      "res_gbm_sp"
+    ))
+  )
+
+names(datos_train_sp)
+names(datos_test_sp)
+```
+
+Para mantener el orden nos creamos un recipe espacial
+
+```{r}
+rec_sp <- recipe(
+  log_precio_m2 ~ .,
+  data = datos_train_sp
+) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+```
+
+## 1. Modelo lineal
+
+```{r}
+# =========================================================
+# MODELO LINEAL ESPACIAL
+# =========================================================
+
+lm_sp_mod <- linear_reg() |>
+  set_engine("lm")
+
+lm_sp_wf <- workflow() |>
+  add_recipe(rec_sp) |>
+  add_model(lm_sp_mod)
+
+lm_sp_fit <- fit(
+  lm_sp_wf,
+  data = datos_train_sp
+)
+
+pred_lm_sp <- predict(
+  lm_sp_fit,
+  new_data = datos_test_sp
+) |>
+  bind_cols(datos_test_sp |> select(log_precio_m2)) |>
+  mutate(
+    modelo = "Lineal espacial",
+    residuo = log_precio_m2 - .pred
+  )
+
+metricas_lm_sp <- tibble(
+  Modelo = "Lineal espacial",
+  RMSE = rmse(pred_lm_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_lm_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_lm_sp, truth = log_precio_m2, estimate = .pred)$.estimate
+)
+
+metricas_lm_sp
+```
+
+*¿Ahora los residuos guardan dependencia espacial?*
+
+```{r}
+# =========================================================
+# MORAN RESIDUOS MODELO LINEAL ESPACIAL
+# =========================================================
+
+pred_lm_sp_train <- predict(
+  lm_sp_fit,
+  new_data = datos_train_sp
+)
+
+datos_train$res_lm_sp <- datos_train_sp$log_precio_m2 - pred_lm_sp_train$.pred
+
+moran_lm_sp <- moran.test(
+  datos_train$res_lm_sp,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater"
+)
+
+moran_lm_sp
+```
+
+La I de Moran ya NO es significativa (p-value = 0.9098) → los residuos ya no presentan autocorrelación espacial → el modelo espacial ha conseguido absorber la dependencia espacial existente en los datos
+
+Es decir, los residuos pasan a comportarse de forma espacialmente aleatoria y, por tanto, la incorporación de la componente espacial permite capturar la dependencia espacial presente en los datos.
+
+## 2. RandomForest
+
+```{r}
+rf_sp_mod <- rand_forest(
+  trees = 500
+) |>
+  set_engine("ranger") |>
+  set_mode("regression")
+
+rf_sp_wf <- workflow() |>
+  add_recipe(rec_sp) |>
+  add_model(rf_sp_mod)
+
+rf_sp_fit <- fit(
+  rf_sp_wf,
+  data = datos_train_sp)
+
+pred_rf_sp <- predict(
+  rf_sp_fit,
+  new_data = datos_test_sp) |>
+  bind_cols(datos_test_sp |> select(log_precio_m2)) |>
+  mutate(
+    modelo = "Random Forest espacial",
+    residuo = log_precio_m2 - .pred)
+
+metricas_rf_sp <- tibble(
+  Modelo = "Random Forest espacial",
+  RMSE = rmse(pred_rf_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_rf_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_rf_sp, truth = log_precio_m2, estimate = .pred)$.estimate)
+
+metricas_rf_sp
+```
+
+¿Ahora los residuos guardan dependencia espacial?
+
+```{r}
+pred_rf_sp_train <- predict(
+  rf_sp_fit,
+  new_data = datos_train_sp)
+
+datos_train$res_rf_sp <- datos_train_sp$log_precio_m2 - pred_rf_sp_train$.pred
+
+moran_rf_sp <- moran.test(
+  datos_train$res_rf_sp,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+
+moran_rf_sp
+```
+
+En los residuos del `RandomForest` tambien obtenemos independencia espacial ya que el estadístico no es estadísticamente significativo, es decir, que el modelo espacial conseguido reducir la dependencia espacial que permanecía en los errores de los modelos sin componente espacial.
+
+## 3. LightGBM
+
+```{r}
+rec_lgbm_sp <- recipe(
+  log_precio_m2 ~ .,
+  data = datos_train_sp
+) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+prep_lgbm_sp <- prep(rec_lgbm_sp)
+
+train_baked_sp <- bake(
+  prep_lgbm_sp,
+  new_data = NULL)
+
+test_baked_sp <- bake(
+  prep_lgbm_sp,
+  new_data = datos_test_sp)
+
+x_train_sp <- train_baked_sp |>
+  select(-log_precio_m2) |>
+  as.matrix()
+
+y_train_sp <- train_baked_sp$log_precio_m2
+
+x_test_sp <- test_baked_sp |>
+  select(-log_precio_m2) |>
+  as.matrix()
+
+y_test_sp <- test_baked_sp$log_precio_m2
+
+dtrain_sp <- lgb.Dataset(
+  data = x_train_sp,
+  label = y_train_sp)
+
+set.seed(123)
+
+modelo_lgbm_sp <- lgb.train(
+  params = list(
+    objective = "regression",
+    metric = "rmse",
+    learning_rate = 0.05,
+    num_leaves = 31,
+    feature_fraction = 0.8
+  ),
+  data = dtrain_sp,
+  nrounds = 500)
+
+pred_lgbm_sp <- predict(
+  modelo_lgbm_sp,
+  x_test_sp)
+
+pred_lgbm_sp_df <- tibble(
+  log_precio_m2 = y_test_sp,
+  .pred = pred_lgbm_sp,
+  modelo = "LightGBM espacial",
+  residuo = log_precio_m2 - .pred)
+
+metricas_lgbm_sp <- tibble(
+  Modelo = "LightGBM espacial",
+  RMSE = rmse(pred_lgbm_sp_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_lgbm_sp_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_lgbm_sp_df, truth = log_precio_m2, estimate = .pred)$.estimate)
+
+metricas_lgbm_sp
+```
+
+```{r}
+#### MORAN LIGHTGBM ESPACIAL
+pred_lgbm_sp_train <- predict(
+  modelo_lgbm_sp,
+  x_train_sp)
+
+datos_train$res_lgbm_sp <- y_train_sp - pred_lgbm_sp_train
+
+moran_lgbm_sp <- moran.test(
+  datos_train$res_lgbm_sp,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater")
+
+moran_lgbm_sp
+```
+
+El contraste de Moran sobre los residuos no es significativo, por lo que no hay evidencia de autocorrelación espacial residual. Esto indica que la incorporación del retardo espacial permite capturar la estructura espacial que quedaba sin explicar en los modelos anteriores.
+
+## 4. SVM
+
+```{r}
+#### SVM ESPACIALIZADO
+
+svr_sp_mod <- svm_rbf(
+  cost = 1,
+  rbf_sigma = 0.1
+) |>
+  set_engine("kernlab") |>
+  set_mode("regression")
+
+svr_sp_wf <- workflow() |>
+  add_recipe(rec_sp) |>
+  add_model(svr_sp_mod)
+
+svr_sp_fit <- fit(
+  svr_sp_wf,
+  data = datos_train_sp
+)
+
+pred_svr_sp <- predict(
+  svr_sp_fit,
+  new_data = datos_test_sp
+) |>
+  bind_cols(datos_test_sp |> select(log_precio_m2)) |>
+  mutate(
+    modelo = "SVM espacial",
+    residuo = log_precio_m2 - .pred
+  )
+
+metricas_svr_sp <- tibble(
+  Modelo = "SVM espacial",
+  RMSE = rmse(pred_svr_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_svr_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_svr_sp, truth = log_precio_m2, estimate = .pred)$.estimate
+)
+
+metricas_svr_sp
+```
+
+```{r}
+#### MORAN SVM ESPACIAL
+
+# =========================================================
+# MORAN RESIDUOS SVM ESPACIAL
+# =========================================================
+
+pred_svr_sp_train <- predict(
+  svr_sp_fit,
+  new_data = datos_train_sp
+)
+
+datos_train$res_svr_sp <- datos_train_sp$log_precio_m2 - pred_svr_sp_train$.pred
+
+moran_svr_sp <- moran.test(
+  datos_train$res_svr_sp,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater"
+)
+
+moran_svr_sp
+```
+
+SVR tambien nos sale no significativo.
+
+## 5. KNN
+
+```{r}
+# =========================================================
+# KNN ESPACIAL
+# =========================================================
+
+knn_sp_mod <- nearest_neighbor(
+  neighbors = 5
+) |>
+  set_engine("kknn") |>
+  set_mode("regression")
+
+knn_sp_wf <- workflow() |>
+  add_recipe(rec_sp) |>
+  add_model(knn_sp_mod)
+
+knn_sp_fit <- fit(
+  knn_sp_wf,
+  data = datos_train_sp
+)
+
+pred_knn_sp <- predict(
+  knn_sp_fit,
+  new_data = datos_test_sp
+) |>
+  bind_cols(datos_test_sp |> select(log_precio_m2)) |>
+  mutate(
+    modelo = "KNN espacial",
+    residuo = log_precio_m2 - .pred
+  )
+
+metricas_knn_sp <- tibble(
+  Modelo = "KNN espacial",
+  RMSE = rmse(pred_knn_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_knn_sp, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_knn_sp, truth = log_precio_m2, estimate = .pred)$.estimate
+)
+
+metricas_knn_sp
+```
+
+```{r}
+# =========================================================
+# MORAN RESIDUOS KNN ESPACIAL
+# =========================================================
+
+pred_knn_sp_train <- predict(
+  knn_sp_fit,
+  new_data = datos_train_sp
+)
+
+datos_train$res_knn_sp <- datos_train_sp$log_precio_m2 - pred_knn_sp_train$.pred
+
+moran_knn_sp <- moran.test(
+  datos_train$res_knn_sp,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater"
+)
+
+moran_knn_sp
+```
+
+I de Moran no significativa, independencia espacial en los residuos.
+
+## 6. GradientBoosting
+
+```{r}
+# =========================================================
+# GRADIENT BOOSTING ESPACIAL
+# =========================================================
+
+prep_sp <- prep(rec_sp)
+
+train_gbm_sp <- bake(
+  prep_sp,
+  new_data = NULL
+)
+
+test_gbm_sp <- bake(
+  prep_sp,
+  new_data = datos_test_sp
+)
+
+set.seed(123)
+
+modelo_gbm_sp <- gbm(
+  formula = log_precio_m2 ~ .,
+  data = train_gbm_sp,
+  distribution = "gaussian",
+  n.trees = 500,
+  interaction.depth = 4,
+  shrinkage = 0.05,
+  n.minobsinnode = 10,
+  cv.folds = 5,
+  verbose = FALSE
+)
+
+best_iter_sp <- gbm.perf(
+  modelo_gbm_sp,
+  method = "cv",
+  plot.it = FALSE
+)
+
+best_iter_sp
+
+pred_gbm_sp <- predict(
+  modelo_gbm_sp,
+  newdata = test_gbm_sp,
+  n.trees = best_iter_sp
+)
+
+pred_gbm_sp_df <- tibble(
+  log_precio_m2 = test_gbm_sp$log_precio_m2,
+  .pred = pred_gbm_sp,
+  modelo = "Gradient Boosting espacial",
+  residuo = log_precio_m2 - .pred
+)
+
+metricas_gbm_sp <- tibble(
+  Modelo = "Gradient Boosting espacial",
+  RMSE = rmse(pred_gbm_sp_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_gbm_sp_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_gbm_sp_df, truth = log_precio_m2, estimate = .pred)$.estimate
+)
+
+metricas_gbm_sp
+```
+
+```{r}
+# =========================================================
+# MORAN RESIDUOS GRADIENT BOOSTING ESPACIAL
+# =========================================================
+
+pred_gbm_sp_train <- predict(
+  modelo_gbm_sp,
+  newdata = train_gbm_sp,
+  n.trees = best_iter_sp
+)
+
+datos_train$res_gbm_sp <- train_gbm_sp$log_precio_m2 - pred_gbm_sp_train
+
+moran_gbm_sp <- moran.test(
+  datos_train$res_gbm_sp,
+  W_dist,
+  zero.policy = TRUE,
+  alternative = "greater"
+)
+
+moran_gbm_sp
+```
+
+Independencia espacial en los residuos.
+
+## Comparacion de los modelos espacializados
+
+Depues de estimar los modelos con componente espacial y calcular la I de Morgan sobre sus residuos, obtenemos que todos los contrastes no son estadísticamente significativos, lo que significa que no se observa autocorrelacion espacial residual, es decir, que los modelos han capturado la componente espacial de mis datos. Para saber que modelo es mejor, miramos las metricas.
+
+```{r}
+metricas_espacial <- bind_rows(
+  metricas_lm_sp,
+  metricas_rf_sp,
+  metricas_lgbm_sp,
+  metricas_svr_sp,
+  metricas_knn_sp,
+  metricas_gbm_sp
+) |>
+  arrange(RMSE)
+
+metricas_espacial
+```
+
+Dentro de los modelos con dependencia espacial explícita, **LightGBM** espacial obtiene el mejor rendimiento predictivo, ya que presenta el menor RMSE, el menor MAE y el mayor R² en el conjunto de test. No obstante, la diferencia respecto al Random Forest espacial es reducida, por lo que ambos modelos muestran un comportamiento muy similar. En conjunto, los modelos basados en árboles siguen siendo los que mejor captan la relación entre las características de la vivienda, la información del entorno y el retardo espacial del precio.
+
+# 7. Kriging
+
+El kriging permite modelizar explícitamente la dependencia espacial mediante el semivariograma y realizar predicciones espaciales continuas sobre el territorio. Con kriging podemos predecir el valor de una variable en puntos donde no la observamos, usando la información de puntos cercanos y la estructura espacial de los datos.
+
+La diferencia con los modelos anteriores es que usan las características de la vivienda para predecir, mientras que el kriging usa la localización y la dependecia espacial entre observaciones. Asique, lo usamos para predecir el logaritmo del precio por metro cuadrado, aprovechando la dependencia espacial detectada entre viviendas cercanas. De forma que las predicciones se basan no solo en la proximidad espacial, sino también en la estructura de dependencia estimada a partir de los datos.
+
+## Kriging ordinario
+
+```{r}
+# =========================================================
+# TRAIN PARA KRIGING ORDINARIO
+# =========================================================
+
+kriging_train <- datos_train |>
+  select(log_precio_m2)
+
+# =========================================================
+# SEMIVARIOGRAMA EMPÍRICO
+# =========================================================
+
+variograma_emp <- variogram(
+  log_precio_m2 ~ 1,
+  data = kriging_train
+)
+
+plot(
+  variograma_emp,
+  main = "Semivariograma empírico del log(precio por m²)"
+)
+```
+
+> El semivariograma empírico muestra que la semivarianza aumenta con la distancia, lo que indica que las viviendas más próximas presentan valores más similares del precio por metro cuadrado. A medida que la distancia crece, las diferencias entre viviendas aumentan hasta alcanzar una zona de estabilización. Este comportamiento confirma la existencia de dependencia espacial y justifica el uso de métodos geoestadísticos como Kriging para realizar predicciones espaciales.
+
+## Ajuste automático del semivariograma
+
+```{r}
+# =========================================================
+# AJUSTE AUTOMÁTICO DEL SEMIVARIOGRAMA
+# =========================================================
+
+modelo_variograma <- autofitVariogram(
+  log_precio_m2 ~ 1,
+  kriging_train
+)
+
+plot(
+  modelo_variograma
+)
+
+modelo_variograma$var_model
+```
+
+Ahora calculamos un modelo teórico que resume la estructura de dependencia espacial de la variable. El modelo ajustado tiene una pepita de 0,05, lo que indica la existencia de variabilidad a distancias muy cortas, atribuible tanto a diferencias específicas entre viviendas como a ruido no explicado. La meseta se encuentra en torno a 0,13 y el rango estimado es de aproximadamente 4,2 km, lo que indica que la dependencia espacial del precio por metro cuadrado se mantiene hasta esa distancia. Este modelo de semivariograma sera utilizado en Kriging para calcular los pesos óptimos de predicción.
+
+## Kriging sobre test
+
+```{r}
+kriging_pred <- krige(
+  formula = log_precio_m2 ~ 1,
+  locations = kriging_train,
+  newdata = datos_test,
+  model = modelo_variograma$var_model
+)
+
+kriging_pred
+```
+
+## Predicciones y metricas
+
+```{r}
+# predicciones
+pred_kriging_df <- tibble(
+  log_precio_m2 = datos_test$log_precio_m2,
+  .pred = kriging_pred$var1.pred,
+  modelo = "Kriging ordinario",
+  residuo = log_precio_m2 - .pred
+)
+
+head(pred_kriging_df)
+
+# metricas
+metricas_kriging <- tibble(
+  Modelo = "Kriging ordinario",
+  RMSE = rmse(pred_kriging_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  MAE  = mae(pred_kriging_df, truth = log_precio_m2, estimate = .pred)$.estimate,
+  R2   = rsq(pred_kriging_df, truth = log_precio_m2, estimate = .pred)$.estimate
+)
+
+metricas_kriging
+```
+
+Esta tabla muestra la comparación entre el valor real y el valor predicho por Kriging para algunas viviendas del conjunto de test.
+
+El modelo de Kriging obtiene un R² de 0.503, por lo que explica aproximadamente el 50,3% de la variabilidad del logaritmo del precio por metro cuadrado en test. Su error medio absoluto es de 0.170 y su RMSE es de 0.232.
+
+Comparándolo con los modelos anteriores, Kriging queda muy parecido al modelo lineal, pero bastante por debajo de los mejores modelos predictivos. Esto puede deberse a que el precio de la vivienda depende no solo de la localización, sino también de características internas del inmueble que Kriging no incorpora directamente en esta especificación.
+
+Ahora obtenemos los residuos
+
+```{r}
+datos_test$res_kriging <- pred_kriging_df$residuo
+
+summary(datos_test$res_kriging)
+```
+
+## Matriz espacial en test
+
+```{r}
+coords_test <- st_coordinates(datos_test)
+
+nb_test_moran <- dnearneigh(
+  coords_test,
+  d1 = 0,
+  d2 = 500
+)
+
+summary(nb_test_moran)
+table(card(nb_test_moran) == 0)
+
+dist_test <- nbdists(
+  nb_test_moran,
+  coords_test
+)
+
+# Control de distancias cero
+sum(unlist(dist_test) == 0)
+
+dist_test <- lapply(
+  dist_test,
+  function(d) {
+    d[d == 0] <- 1
+    d
+  }
+)
+
+pesos_test <- lapply(
+  dist_test,
+  function(d) 1 / (d^2)
+)
+
+W_test_moran <- nb2listw(
+  nb_test_moran,
+  glist = pesos_test,
+  style = "W",
+  zero.policy = TRUE
+)
+```
+
+Hacemos la I de Moran para los residuos del kriging
+
+```{r}
+moran_kriging <- moran.test(
+  datos_test$res_kriging,
+  W_test_moran,
+  zero.policy = TRUE,
+  alternative = "greater"
+)
+
+moran_kriging
+```
+
+El contraste no es estadistícamente significativo, lo que significa que no podemos afirmar que los residuos del Kriging tengan autocorrelación espacial positiva significativa, es decir, que el Kriging ha conseguido capturar parte de la estructura espacial de los datos.
+
+#### MAPA DE PREDICCIONES KRIGING
+
+```{r}
+# =========================================================
+# MAPA DE PREDICCIONES KRIGING
+# =========================================================
+
+kriging_mapa <- datos_test |>
+  mutate(
+    pred_kriging = kriging_pred$var1.pred
+  ) |>
+  st_transform(4326)
+
+tmap_mode("plot")
+
+tm_shape(kriging_mapa) +
+  tm_basemap("OpenStreetMap") +
+  tm_dots(
+    col = "pred_kriging",
+    palette = "viridis",
+    size = 0.12,
+    alpha = 0.8
+  ) +
+  tm_title(
+    "Predicciones mediante Kriging ordinario",
+    fontface = "bold"
+  ) +
+  tm_layout(
+    frame = FALSE,
+    legend.outside = TRUE
+  )
+```
+
+Con este mapa observamos dónde predice Kriging precios por m² más altos y más bajos en el conjunto de test. Observamos que las predicciones nos son homogéneas en el espacio, sino que presentan diferencias según la localización, lo que indica que el método capta parte de la estructura espacial del precio. No obstante, al basarse principalmente en la localización, su capacidad predictiva es inferior a la de los modelos que incorporan las características de las viviendas.
+
+# 8. Comparativa final de los modelos
+
+Comparamos las metricas de todos los modelos que hemos hecho, con espacialidad, sin espacialidad y el kriging ordinario.
+
+```{r}
+# =========================================================
+# COMPARACIÓN FINAL DE TODOS LOS MODELOS
+# =========================================================
+
+metricas_final <- bind_rows(
+  metricas_lm,
+  metricas_rf,
+  metricas_lgbm,
+  metricas_svr,
+  metricas_knn,
+  metricas_gbm,
+  metricas_lm_sp,
+  metricas_rf_sp,
+  metricas_lgbm_sp,
+  metricas_svr_sp,
+  metricas_knn_sp,
+  metricas_gbm_sp,
+  metricas_kriging
+) |>
+  mutate(
+    Tipo = case_when(
+      Modelo %in% c(
+        "Lineal",
+        "Random Forest",
+        "LightGBM",
+        "SVM",
+        "KNN",
+        "Gradient Boosting"
+      ) ~ "Sin dependencia espacial explícita",
+      
+      Modelo %in% c(
+        "Lineal espacial",
+        "Random Forest espacial",
+        "LightGBM espacial",
+        "SVM espacial",
+        "KNN espacial",
+        "Gradient Boosting espacial"
+      ) ~ "Con dependencia espacial explícita",
+      
+      Modelo == "Kriging ordinario" ~ "Kriging ordinario",
+      
+      TRUE ~ "Otro"
+    )
+  ) |>
+  arrange(RMSE)
+
+metricas_final
+```
+
+Comparando las metricas de todos los modelos observamos que los mejores con mejor rendimiento son aquellos que no tienen componente espacial, especialmente `LightGBM` y `Random Forest`. - LightGBM obtiene el mejor resultado global, con el menor RMSE, el menor MAE y el mayorR². - Random Forest queda muy próximo, por lo que también puede considerarse uno de los modelos más competitivos.
+
+Respecto a los modelos con espacialidad, estos consiguen corregir la autocorrelación espacial de los residuos, pero no mejoran las métricas predictivas frente a los mejores modelos no espaciales. Entre ellos, el mejor es `RF espacial`, seguido de `LightGBM espacial`, aunque ambos quedan por debajo de **LightGBM y Random Forest sin espacialidad**.
+
+Por último, el Kriging presenta un rendimiento similar al modelo lineal, pero inferior al de los modelos de machine learning. Esto indica que, aunque la localización aporta información relevante, el precio por metro cuadrado depende también de características internas de la vivienda que los modelos predictivos capturan mejor.
+
+Comparamos graficamente el RMSE:
+
+```{r}
+# grafico comparativo
+ggplot(
+  metricas_final,
+  aes(x = reorder(Modelo, RMSE), y = RMSE, fill = Tipo)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Comparación final de modelos según el RMSE",
+    x = "Modelo",
+    y = "RMSE en test",
+    fill = "Tipo de modelo"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Comparamos graficamente el R2:
+
+```{r}
+ggplot(
+  metricas_final,
+  aes(x = reorder(Modelo, R2), y = R2, fill = Tipo)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Comparación final de modelos según R²",
+    x = "Modelo",
+    y = "R² en test",
+    fill = "Tipo de modelo"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+# 9. Ensamblado
+
+Ahora vamos a hacer el modelo final que usaremos para predecir usando el ensamblado. Con el ensamblado combinamos varios modelos con el objetivo de obtener una prediccion final mas robusta y estable. De esta forma aprovechamos la información de los modelos y reducimos la dependencia de los errores particulares de cada uno.
+
+Obtenemos que los mejores 5 modelos son: LightGBM, RandomForest y GradientBoosting sin espacialidad, y LightGBM y RandomForest con espacialidad.
+
+```{r}
+# =========================================================
+# ENSAMBLADO PONDERADO
+# =========================================================
+
+# =========================================================
+# PREDICCIONES INDIVIDUALES
+# =========================================================
+
+pred_rf_ens <- pred_rf_sp$.pred
+
+pred_lgbm_ens <- pred_lgbm_sp_df$.pred
+
+pred_gbm_ens <- pred_gbm_sp_df$.pred
+
+pred_svr_ens <- pred_svr_sp$.pred
+
+pred_knn_ens <- pred_knn_sp$.pred
+
+
+pred_ensemble_weighted <- (
+  pred_lgbm_ens * 0.35 +
+  pred_rf_ens   * 0.35 +
+  pred_gbm_ens  * 0.15 +
+  pred_svr_ens  * 0.10 +
+  pred_knn_ens  * 0.05
+)
+
+pred_ensemble_weighted_df <- tibble(
+  log_precio_m2 = datos_test_sp$log_precio_m2,
+  .pred = pred_ensemble_weighted,
+  modelo = "Ensamblado espacial ponderado",
+  residuo = log_precio_m2 - .pred
+)
+
+metricas_ensemble_weighted <- tibble(
+  Modelo = "Ensamblado espacial ponderado",
+
+  RMSE = rmse(
+    pred_ensemble_weighted_df,
+    truth = log_precio_m2,
+    estimate = .pred
+  )$.estimate,
+
+  MAE = mae(
+    pred_ensemble_weighted_df,
+    truth = log_precio_m2,
+    estimate = .pred
+  )$.estimate,
+
+  R2 = rsq(
+    pred_ensemble_weighted_df,
+    truth = log_precio_m2,
+    estimate = .pred
+  )$.estimate
+)
+
+metricas_ensemble_weighted
+```
+
+Para realizar la predicción hemos hecho un ensamblado ponderado, dandole más pesos a los modelos que tenían mejor calidad predictiva. Para ello, no hemos incluido en el ensamblado el Krigging ya que tenía una peor calidad predictiva y lo más probabale es que añadiera ruido a la predicción.
+
+# 10. Shinny
+
+## 1. Guardamos los objetos
+
+```{r}
+saveRDS(rf_sp_fit, "rf_sp_fit.rds")
+saveRDS(modelo_lgbm_sp, "modelo_lgbm_sp.rds")
+saveRDS(modelo_gbm_sp, "modelo_gbm_sp.rds")
+saveRDS(svr_sp_fit, "svr_sp_fit.rds")
+saveRDS(knn_sp_fit, "knn_sp_fit.rds")
+
+saveRDS(prep_sp, "prep_sp.rds")
+
+saveRDS(ventana_prediccion, "ventana_prediccion.rds")
+
+saveRDS(datos_train, "datos_train.rds")
+```
+
+## barrios
+
+```{r}
+barrios <- st_read("Barrios/BARRIOS.shp")
+
+barrios <- st_transform(barrios, 4326)
+
+names(barrios)
+```
+
+```{r}
+plot(st_geometry(barrios))
+```
+
+## 2. App
+
+
+```{r}
+# =============================================================================
+# TASADOR INTELIGENTE DE VIVIENDAS - SHINY APP
+# Predicción del precio por m² mediante ensamblado de modelos ML
+# =============================================================================
+
+library(shiny)
+library(bs4Dash)
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(leaflet.extras)
+library(spdep)
+library(tidymodels)
+library(lightgbm)
+library(gbm)
+library(kernlab)
+library(kknn)
+library(ranger)
+library(waiter)
+library(shinyWidgets)
+library(plotly)
+library(fresh)
+
+# =============================================================================
+# CARGA DE MODELOS Y OBJETOS
+# =============================================================================
+
+rf_sp_fit        <- readRDS("rf_sp_fit.rds")
+modelo_lgbm_sp   <- readRDS("modelo_lgbm_sp.rds")
+modelo_gbm_sp    <- readRDS("modelo_gbm_sp.rds")
+svr_sp_fit       <- readRDS("svr_sp_fit.rds")
+knn_sp_fit       <- readRDS("knn_sp_fit.rds")
+prep_sp          <- readRDS("prep_sp.rds")
+ventana_prediccion <- readRDS("ventana_prediccion.rds")
+datos_train      <- readRDS("datos_train.rds")
+barrios          <- st_read("Barrios/BARRIOS.shp") |> st_transform(4326)
+
+# =============================================================================
+# FUNCIÓN: RETARDO ESPACIAL PARA UNA NUEVA OBSERVACIÓN
+# =============================================================================
+
+calcular_lag_nuevo <- function(nuevo_punto_sf, datos_train, radio = 500, potencia = 2) {
+  datos_train_proj <- st_transform(datos_train, 25830)
+  nuevo_proj       <- st_transform(nuevo_punto_sf, 25830)
+
+  vecinos <- st_is_within_distance(nuevo_proj, datos_train_proj, dist = radio)[[1]]
+
+  if (length(vecinos) == 0) return(NA_real_)
+
+  distancias <- as.numeric(st_distance(nuevo_proj, datos_train_proj[vecinos, ], by_element = FALSE))
+  distancias[distancias == 0] <- 1
+  pesos <- 1 / (distancias ^ potencia)
+
+  sum(datos_train$log_precio_m2[vecinos] * pesos, na.rm = TRUE) /
+    sum(pesos, na.rm = TRUE)
+}
+
+# =============================================================================
+# FUNCIÓN PRINCIPAL DE PREDICCIÓN (ENSAMBLADO PONDERADO)
+# =============================================================================
+
+predecir_precio <- function(nueva_obs_df) {
+
+  nueva_baked <- bake(prep_sp, new_data = nueva_obs_df)
+
+  # LightGBM
+  x_nuevo <- nueva_baked |> select(-log_precio_m2) |> as.matrix()
+  pred_lgbm <- predict(modelo_lgbm_sp, x_nuevo)
+
+  # Random Forest
+  pred_rf   <- predict(rf_sp_fit, new_data = nueva_obs_df)$.pred
+
+  # GBM
+  nueva_baked_gbm <- bake(prep_sp, new_data = nueva_obs_df)
+  pred_gbm  <- predict(modelo_gbm_sp, newdata = nueva_baked_gbm,
+                       n.trees = modelo_gbm_sp$n.trees)
+
+  # SVR
+  pred_svr  <- predict(svr_sp_fit, new_data = nueva_obs_df)$.pred
+
+  # KNN
+  pred_knn  <- predict(knn_sp_fit, new_data = nueva_obs_df)$.pred
+
+  # Ensamblado ponderado (mismos pesos del script original)
+  pred_log <- pred_lgbm * 0.35 +
+              pred_rf   * 0.35 +
+              pred_gbm  * 0.15 +
+              pred_svr  * 0.10 +
+              pred_knn  * 0.05
+
+  # Volver a escala original (exponencial)
+  precio_m2 <- exp(pred_log)
+  return(list(
+    precio_m2   = precio_m2,
+    pred_log    = pred_log,
+    pred_lgbm   = exp(pred_lgbm),
+    pred_rf     = exp(pred_rf),
+    pred_gbm    = exp(pred_gbm),
+    pred_svr    = exp(pred_svr),
+    pred_knn    = exp(pred_knn)
+  ))
+}
+
+# =============================================================================
+# PALETA Y TEMA
+# =============================================================================
+
+mi_tema <- create_theme(
+  bs4dash_vars(
+    navbar_light_color        = "#fff",
+    navbar_light_active_color = "#fff"
+  ),
+  bs4dash_sidebar_light(
+    bg     = "#1a1a2e",
+    color  = "#eee",
+    hover_color = "#fff",
+    active_color = "#e94560"
+  ),
+  bs4dash_color(
+    blue = "#16213e",
+    red  = "#e94560"
+  )
+)
+
+# =============================================================================
+# UI
+# =============================================================================
+
+ui <- bs4DashPage(
+  freshTheme = mi_tema,
+  title = "Tasador Inteligente",
+  preloader = list(html = tagList(spin_flower(), h4("Cargando modelos...")), color = "#1a1a2e"),
+
+  header = bs4DashNavbar(
+    title = bs4DashBrand(
+      title = tags$span(
+        tags$i(class = "fas fa-home", style = "color:#e94560; margin-right:8px;"),
+        tags$strong("TasadorIA", style = "color:white; font-size:1.3rem;"),
+        tags$small(" | Predicción del precio de vivienda", style = "color:#aaa; font-size:0.8rem;")
+      ),
+      color = "white"
+    )
+  ),
+
+  sidebar = bs4DashSidebar(
+    skin = "dark",
+    bs4SidebarMenu(
+      bs4SidebarMenuItem("Tasador",         tabName = "tasador",   icon = icon("calculator")),
+      bs4SidebarMenuItem("Mapa de barrios", tabName = "mapa",      icon = icon("map-marked-alt")),
+      bs4SidebarMenuItem("Modelos",         tabName = "modelos",   icon = icon("chart-bar")),
+      bs4SidebarMenuItem("Información",     tabName = "info",      icon = icon("info-circle"))
+    )
+  ),
+
+  body = bs4DashBody(
+    # CSS personalizado
+    tags$head(
+      tags$style(HTML("
+        body { background-color: #f0f2f5 !important; font-family: 'Segoe UI', sans-serif; }
+
+        .card { border-radius: 12px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.08) !important; border: none !important; }
+        .card-header { border-radius: 12px 12px 0 0 !important; font-weight: 600; }
+
+        .precio-box {
+          background: linear-gradient(135deg, #e94560, #0f3460);
+          border-radius: 16px;
+          padding: 30px;
+          text-align: center;
+          color: white;
+          box-shadow: 0 8px 30px rgba(233,69,96,0.35);
+          transition: transform 0.2s;
+        }
+        .precio-box:hover { transform: translateY(-3px); }
+        .precio-valor { font-size: 3.2rem; font-weight: 800; letter-spacing: -1px; }
+        .precio-label { font-size: 1rem; opacity: 0.85; margin-top: 5px; }
+        .precio-total { font-size: 1.5rem; font-weight: 600; margin-top: 10px; opacity: 0.9; }
+
+        .warning-box {
+          background: linear-gradient(135deg, #ff6b35, #f7c59f);
+          border-radius: 12px; padding: 20px; color: white;
+          box-shadow: 0 4px 15px rgba(255,107,53,0.3);
+        }
+        .warning-box h4 { font-weight: 700; margin-bottom: 8px; }
+
+        .seccion-header {
+          font-size: 0.75rem; font-weight: 700; letter-spacing: 1.5px;
+          color: #e94560; text-transform: uppercase; margin: 18px 0 10px;
+          border-bottom: 2px solid #e94560; padding-bottom: 4px;
+        }
+
+        .selector-card { cursor: pointer; transition: all 0.2s; border-radius: 10px !important;
+                         border: 2px solid #dee2e6 !important; }
+        .selector-card:hover { border-color: #e94560 !important; transform: translateY(-2px); }
+        .selector-card.selected { border-color: #e94560 !important; background: #fff5f7 !important; }
+
+        .barrio-label { font-size: 0.75rem; font-weight: 600; color: #555; text-align: center; padding: 8px; }
+
+        .metric-mini { background: #fff; border-radius: 10px; padding: 12px 16px;
+                       margin-bottom: 8px; border-left: 4px solid #e94560; }
+        .metric-mini .valor { font-size: 1.4rem; font-weight: 700; color: #1a1a2e; }
+        .metric-mini .etiqueta { font-size: 0.75rem; color: #888; margin-top: 2px; }
+
+        .btn-tasar {
+          background: linear-gradient(135deg, #e94560, #c0392b) !important;
+          border: none !important; border-radius: 50px !important;
+          font-size: 1.1rem !important; font-weight: 700 !important;
+          padding: 14px 40px !important; letter-spacing: 0.5px !important;
+          box-shadow: 0 6px 20px rgba(233,69,96,0.4) !important;
+          transition: all 0.2s !important; color: white !important;
+        }
+        .btn-tasar:hover { transform: translateY(-2px) !important; box-shadow: 0 10px 25px rgba(233,69,96,0.5) !important; }
+
+        .form-control { border-radius: 8px !important; border: 1.5px solid #dee2e6 !important; }
+        .form-control:focus { border-color: #e94560 !important; box-shadow: 0 0 0 3px rgba(233,69,96,0.15) !important; }
+
+        .leaflet-container { border-radius: 12px; }
+
+        .badge-modelo { display: inline-block; background: #1a1a2e; color: white;
+                        border-radius: 20px; padding: 3px 10px; font-size: 0.7rem; margin: 2px; }
+
+        .coords-badge { background: #1a1a2e; color: #e94560; border-radius: 8px;
+                        padding: 8px 14px; font-family: monospace; font-size: 0.85rem; display: inline-block; }
+
+        .info-card-header { background: linear-gradient(135deg, #1a1a2e, #0f3460) !important; color: white !important; }
+
+        .prog-bar-custom .progress-bar { background: linear-gradient(90deg, #e94560, #c0392b); }
+      "))
+    ),
+
+    bs4TabItems(
+
+      # -----------------------------------------------------------------------
+      # TAB 1: TASADOR
+      # -----------------------------------------------------------------------
+      bs4TabItem(tabName = "tasador",
+        fluidRow(
+          # --- Panel izquierdo: formulario ---
+          column(width = 5,
+            bs4Card(
+              width = 12, solidHeader = TRUE, status = "danger",
+              headerBorder = FALSE,
+              header = tagList(
+                tags$i(class = "fas fa-sliders-h", style = "margin-right:8px;"),
+                "Características de la vivienda"
+              ),
+
+              # UBICACIÓN
+              tags$div(class = "seccion-header", tags$i(class = "fas fa-map-pin", style = "margin-right:6px;"), "Ubicación"),
+              fluidRow(
+                column(6,
+                  numericInput("lat_input", label = tags$span(tags$i(class="fas fa-globe", style="color:#e94560;"), " Latitud"),
+                               value = 40.416, step = 0.001, min = 40.3, max = 40.55)
+                ),
+                column(6,
+                  numericInput("lon_input", label = tags$span(tags$i(class="fas fa-globe", style="color:#e94560;"), " Longitud"),
+                               value = -3.703, step = 0.001, min = -3.85, max = -3.55)
+                )
+              ),
+              tags$p(tags$small(class = "text-muted",
+                tags$i(class = "fas fa-info-circle"), " Selecciona el barrio en el ",
+                tags$strong("mapa"), " para rellenar las coordenadas automáticamente.")),
+
+              tags$hr(style="margin: 12px 0;"),
+
+              # CARACTERÍSTICAS FÍSICAS
+              tags$div(class = "seccion-header", tags$i(class = "fas fa-ruler-combined", style = "margin-right:6px;"), "Características físicas"),
+              fluidRow(
+                column(6,
+                  numericInput("built_area", label = tags$span(tags$i(class="fas fa-expand-arrows-alt", style="color:#e94560;"), " Metros cuadrados"),
+                               value = 80, min = 20, max = 500, step = 5)
+                ),
+                column(6,
+                  numericInput("baths", label = tags$span(tags$i(class="fas fa-bath", style="color:#e94560;"), " Baños"),
+                               value = 1, min = 1, max = 6, step = 1)
+                )
+              ),
+              fluidRow(
+                column(6,
+                  numericInput("age", label = tags$span(tags$i(class="fas fa-calendar-alt", style="color:#e94560;"), " Antigüedad (años)"),
+                               value = 20, min = 0, max = 120, step = 1)
+                ),
+                column(6,
+                  numericInput("floor", label = tags$span(tags$i(class="fas fa-building", style="color:#e94560;"), " Planta"),
+                               value = 3, min = 0, max = 30, step = 1)
+                )
+              ),
+
+              tags$hr(style="margin: 12px 0;"),
+
+              # TIPO Y EXTRAS
+              tags$div(class = "seccion-header", tags$i(class = "fas fa-star", style = "margin-right:6px;"), "Tipo y extras"),
+
+              fluidRow(
+                column(6,
+                  selectInput("type_house", label = tags$span(tags$i(class="fas fa-home", style="color:#e94560;"), " Tipo de vivienda"),
+                              choices = c("Piso" = "piso", "Casa" = "casa", "Ático" = "atico",
+                                          "Dúplex" = "duplex", "Estudio" = "estudio"),
+                              selected = "piso")
+                ),
+                column(6,
+                  selectInput("good_cond", label = tags$span(tags$i(class="fas fa-check-circle", style="color:#e94560;"), " Buen estado"),
+                              choices = c("Sí" = 1, "No" = 0), selected = 1)
+                )
+              ),
+
+              fluidRow(
+                column(3,
+                  tags$div(style = "text-align:center; padding: 8px;",
+                    tags$div(class = "seccion-header", style = "border:none; font-size:0.65rem;", "Garaje"),
+                    switchInput("garage", value = FALSE, onStatus = "danger", size = "mini")
+                  )
+                ),
+                column(3,
+                  tags$div(style = "text-align:center; padding: 8px;",
+                    tags$div(class = "seccion-header", style = "border:none; font-size:0.65rem;", "Ascensor"),
+                    switchInput("elevator", value = TRUE, onStatus = "danger", size = "mini")
+                  )
+                ),
+                column(3,
+                  tags$div(style = "text-align:center; padding: 8px;",
+                    tags$div(class = "seccion-header", style = "border:none; font-size:0.65rem;", "Aire acond."),
+                    switchInput("air_cond", value = FALSE, onStatus = "danger", size = "mini")
+                  )
+                ),
+                column(3,
+                  tags$div(style = "text-align:center; padding: 8px;",
+                    tags$div(class = "seccion-header", style = "border:none; font-size:0.65rem;", "Piscina"),
+                    switchInput("swimming_pool", value = FALSE, onStatus = "danger", size = "mini")
+                  )
+                )
+              ),
+
+              tags$hr(style="margin: 16px 0;"),
+
+              tags$div(style = "text-align:center;",
+                actionButton("predecir", "  Tasar vivienda",
+                             icon = icon("magic"),
+                             class = "btn-tasar")
+              )
+            )
+          ),
+
+          # --- Panel derecho: resultados ---
+          column(width = 7,
+            # RESULTADO PRINCIPAL
+            uiOutput("resultado_ui"),
+
+            # MINI MAPA DE LOCALIZACIÓN
+            bs4Card(
+              width = 12, solidHeader = FALSE,
+              header = tagList(
+                tags$i(class = "fas fa-map-marked-alt", style = "margin-right:8px; color:#e94560;"),
+                "Localización seleccionada"
+              ),
+              leafletOutput("mapa_mini", height = "220px")
+            )
+          )
+        )
+      ),
+
+      # -----------------------------------------------------------------------
+      # TAB 2: MAPA DE BARRIOS
+      # -----------------------------------------------------------------------
+      bs4TabItem(tabName = "mapa",
+        fluidRow(
+          column(width = 8,
+            bs4Card(
+              width = 12, solidHeader = TRUE, status = "danger",
+              header = tagList(
+                tags$i(class = "fas fa-map", style = "margin-right:8px;"),
+                "Selecciona un barrio para obtener sus coordenadas"
+              ),
+              leafletOutput("mapa_barrios", height = "550px"),
+              tags$div(style = "margin-top:10px;",
+                tags$small(class = "text-muted",
+                  tags$i(class = "fas fa-mouse-pointer"), " Haz clic sobre un barrio para seleccionarlo. ",
+                  "Las coordenadas del centroide se trasladarán automáticamente al formulario de tasación."
+                )
+              )
+            )
+          ),
+          column(width = 4,
+            bs4Card(
+              width = 12, solidHeader = TRUE, status = "navy",
+              header = tagList(
+                tags$i(class = "fas fa-info-circle", style = "margin-right:8px;"),
+                "Barrio seleccionado"
+              ),
+              uiOutput("info_barrio")
+            ),
+            bs4Card(
+              width = 12, solidHeader = FALSE,
+              header = tagList(
+                tags$i(class = "fas fa-lightbulb", style = "margin-right:8px; color:#e94560;"),
+                "¿Cómo usar el mapa?"
+              ),
+              tags$ol(style = "padding-left:18px; font-size:0.9rem; color:#555;",
+                tags$li("Explora el mapa y haz clic en cualquier barrio"),
+                tags$li("Las coordenadas se copiarán al formulario"),
+                tags$li("Completa el resto de características"),
+                tags$li("Pulsa", tags$strong(" Tasar vivienda "))
+              )
+            )
+          )
+        )
+      ),
+
+      # -----------------------------------------------------------------------
+      # TAB 3: MODELOS
+      # -----------------------------------------------------------------------
+      bs4TabItem(tabName = "modelos",
+        fluidRow(
+          bs4Card(
+            width = 12, solidHeader = TRUE, status = "danger",
+            header = tagList(
+              tags$i(class = "fas fa-chart-bar", style = "margin-right:8px;"),
+              "Rendimiento de los modelos en test (R², RMSE, MAE)"
+            ),
+            plotlyOutput("grafico_modelos", height = "420px")
+          )
+        ),
+        fluidRow(
+          column(width = 4,
+            bs4InfoBox(
+              width = 12, title = "Mejor modelo individual",
+              value = "LightGBM espacial", icon = icon("trophy"),
+              color = "danger", subtitle = "R² = 0.682 | RMSE = 0.188"
+            )
+          ),
+          column(width = 4,
+            bs4InfoBox(
+              width = 12, title = "Ensamblado final",
+              value = "5 modelos ponderados", icon = icon("layer-group"),
+              color = "navy", subtitle = "Combinación óptima para mayor robustez"
+            )
+          ),
+          column(width = 4,
+            bs4InfoBox(
+              width = 12, title = "I de Moran residuos",
+              value = "No significativa", icon = icon("check-circle"),
+              color = "success", subtitle = "Dependencia espacial capturada ✓"
+            )
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            width = 12, solidHeader = FALSE,
+            header = tagList(
+              tags$i(class = "fas fa-balance-scale", style = "margin-right:8px; color:#e94560;"),
+              "Pesos del ensamblado"
+            ),
+            fluidRow(
+              column(width = 12,
+                plotlyOutput("grafico_pesos", height = "200px")
+              )
+            )
+          )
+        )
+      ),
+
+      # -----------------------------------------------------------------------
+      # TAB 4: INFORMACIÓN
+      # -----------------------------------------------------------------------
+      bs4TabItem(tabName = "info",
+        fluidRow(
+          bs4Card(
+            width = 6, solidHeader = TRUE, status = "danger",
+            headerBorder = FALSE,
+            header = tagList(tags$i(class = "fas fa-cogs", style = "margin-right:8px;"), "Metodología"),
+            tags$div(style = "font-size:0.92rem; color:#444; line-height:1.7;",
+              tags$p("Esta aplicación implementa un modelo de valoración automática (AVM) basado en técnicas de Machine Learning con componente espacial."),
+              tags$h6(tags$i(class="fas fa-map-marker-alt", style="color:#e94560;"), " Componente espacial"),
+              tags$p("Para cada vivienda se calcula el ", tags$strong("retardo espacial"), " del precio (log_precio_m2_w): la media ponderada por distancia inversa al cuadrado de los precios observados en un radio de 500 metros en el conjunto de entrenamiento."),
+              tags$h6(tags$i(class="fas fa-sitemap", style="color:#e94560;"), " Ensamblado ponderado"),
+              tags$div(class="metric-mini",
+                tags$div(class="valor", "LightGBM"), tags$div(class="etiqueta", "Peso: 35%")
+              ),
+              tags$div(class="metric-mini",
+                tags$div(class="valor", "Random Forest"), tags$div(class="etiqueta", "Peso: 35%")
+              ),
+              tags$div(class="metric-mini",
+                tags$div(class="valor", "Gradient Boosting"), tags$div(class="etiqueta", "Peso: 15%")
+              ),
+              tags$div(class="metric-mini",
+                tags$div(class="valor", "SVM (SVR)"), tags$div(class="etiqueta", "Peso: 10%")
+              ),
+              tags$div(class="metric-mini",
+                tags$div(class="valor", "KNN"), tags$div(class="etiqueta", "Peso: 5%")
+              )
+            )
+          ),
+          bs4Card(
+            width = 6, solidHeader = TRUE, status = "navy",
+            headerBorder = FALSE,
+            header = tagList(tags$i(class = "fas fa-database", style = "margin-right:8px;"), "Variables del modelo"),
+            tags$div(style = "font-size:0.9rem; color:#444;",
+              tags$table(class = "table table-sm table-hover",
+                tags$thead(tags$tr(
+                  tags$th("Variable"), tags$th("Descripción")
+                )),
+                tags$tbody(
+                  tags$tr(tags$td(tags$code("built.area")), tags$td("Superficie construida (m²)")),
+                  tags$tr(tags$td(tags$code("baths")), tags$td("Número de baños")),
+                  tags$tr(tags$td(tags$code("age")), tags$td("Antigüedad del inmueble (años)")),
+                  tags$tr(tags$td(tags$code("floor")), tags$td("Planta del piso")),
+                  tags$tr(tags$td(tags$code("type.house")), tags$td("Tipo de vivienda")),
+                  tags$tr(tags$td(tags$code("good.cond")), tags$td("Buen estado de conservación")),
+                  tags$tr(tags$td(tags$code("garage")), tags$td("Garaje incluido")),
+                  tags$tr(tags$td(tags$code("elevator")), tags$td("Ascensor")),
+                  tags$tr(tags$td(tags$code("air.cond")), tags$td("Aire acondicionado")),
+                  tags$tr(tags$td(tags$code("swimming.pool")), tags$td("Piscina")),
+                  tags$tr(
+                    tags$td(tags$code("log_precio_m2_w"), tags$span(class="badge badge-danger", "Espacial")),
+                    tags$td("Retardo espacial del log-precio (500m)")
+                  )
+                )
+              )
+            )
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            width = 12, solidHeader = FALSE,
+            header = tagList(
+              tags$i(class="fas fa-exclamation-triangle", style="margin-right:8px; color:#e94560;"),
+              "Advertencias y limitaciones"
+            ),
+            tags$div(style="font-size:0.9rem; color:#555; line-height:1.8;",
+              tags$ul(
+                tags$li("La predicción solo es válida dentro de la ", tags$strong("ventana espacial"), " definida por el conjunto de entrenamiento (500m de buffer alrededor de los datos)."),
+                tags$li("El precio predicho es el ", tags$strong("precio por metro cuadrado"), ". El precio total se calcula multiplicando por la superficie introducida."),
+                tags$li("El modelo se ha estimado sobre la escala logarítmica. La predicción final aplica la función exponencial para volver a la escala original (€/m²)."),
+                tags$li("Las variables de entorno (criminalidad, demografía, etc.) se fijan a sus valores medios en la muestra de entrenamiento cuando no están disponibles.")
+              )
+            )
+          )
+        )
+      )
+    )
+  ),
+
+  footer = bs4DashFooter(
+    left = tagList(
+      tags$span(style = "color:#888; font-size:0.8rem;",
+        tags$i(class = "fas fa-code", style = "color:#e94560;"),
+        " TasadorIA · Cristina Martínez, Laura López, Verónica Yebra, Marina Parra"
+      )
+    ),
+    right = tags$span(style = "color:#888; font-size:0.8rem;",
+      "Modelos espaciales de valoración automática"
+    )
+  )
+)
+
+# =============================================================================
+# SERVER
+# =============================================================================
+
+server <- function(input, output, session) {
+
+  # --- Valores reactivos ---
+  rv <- reactiveValues(
+    lat            = 40.416,
+    lon            = -3.703,
+    barrio_nombre  = NULL,
+    resultado      = NULL,
+    dentro_ventana = TRUE
+  )
+
+  # --- Sincronizar coordenadas desde inputs manuales ---
+  observeEvent(input$lat_input, {
+    req(!is.na(input$lat_input))
+    rv$lat <- input$lat_input
+  }, ignoreNULL = TRUE)
+  observeEvent(input$lon_input, {
+    req(!is.na(input$lon_input))
+    rv$lon <- input$lon_input
+  }, ignoreNULL = TRUE)
+
+  # --- Mapa de barrios ---
+  output$mapa_barrios <- renderLeaflet({
+    leaflet(barrios) |>
+      addProviderTiles(providers$CartoDB.Positron) |>
+      addPolygons(
+        fillColor   = "#1a1a2e",
+        weight      = 1.5,
+        opacity     = 1,
+        color       = "#e94560",
+        fillOpacity = 0.25,
+        highlight   = highlightOptions(
+          weight      = 3,
+          color       = "#e94560",
+          fillOpacity = 0.5,
+          bringToFront = TRUE
+        ),
+        label = ~NOMBRE,
+        labelOptions = labelOptions(
+          style = list("font-weight" = "bold", "color" = "#1a1a2e"),
+          textsize = "13px"
+        ),
+        layerId = ~NOMBRE
+      )
+  })
+
+  # --- Click en barrio ---
+  observeEvent(input$mapa_barrios_shape_click, {
+    click <- input$mapa_barrios_shape_click
+
+    # Guardamos en variables locales para evitar problemas de scope
+    click_id <- click$id
+    if (is.null(click_id) || click_id == "") return()
+
+    barrio_sel <- barrios[barrios$NOMBRE == click_id, ]
+    if (nrow(barrio_sel) == 0) return()
+
+    # Suprimir aviso de st_centroid en datos geográficos
+    suppressWarnings({
+      centroide_sf  <- st_centroid(barrio_sel)
+    })
+    coords_c <- st_coordinates(centroide_sf)
+
+    lat_c <- round(coords_c[1, "Y"], 5)
+    lon_c <- round(coords_c[1, "X"], 5)
+
+    rv$lat           <- lat_c
+    rv$lon           <- lon_c
+    rv$barrio_nombre <- click_id
+
+    updateNumericInput(session, "lat_input", value = lat_c)
+    updateNumericInput(session, "lon_input", value = lon_c)
+
+    # Resaltar barrio seleccionado
+    leafletProxy("mapa_barrios") |>
+      clearGroup("seleccionado") |>
+      addPolygons(
+        data        = barrio_sel,
+        fillColor   = "#e94560",
+        weight      = 2.5,
+        color       = "#c0392b",
+        fillOpacity = 0.55,
+        group       = "seleccionado"
+      )
+  })
+
+  # --- Info del barrio seleccionado ---
+  output$info_barrio <- renderUI({
+    if (is.null(rv$barrio_nombre)) {
+      tags$div(style = "text-align:center; padding:30px; color:#aaa;",
+        tags$i(class = "fas fa-map-marker-alt", style = "font-size:2rem; color:#dee2e6;"),
+        tags$p(style = "margin-top:12px; font-size:0.9rem;", "Haz clic en un barrio del mapa para seleccionarlo")
+      )
+    } else {
+      tags$div(
+        tags$div(style = "background: linear-gradient(135deg,#1a1a2e,#0f3460); border-radius:10px; padding:20px; color:white; text-align:center;",
+          tags$i(class = "fas fa-map-marked-alt", style = "font-size:1.8rem; color:#e94560; margin-bottom:10px;"),
+          tags$h5(style = "font-weight:700; margin:8px 0;", rv$barrio_nombre)
+        ),
+        tags$div(style = "margin-top:12px;",
+          tags$div(class = "coords-badge",
+            tags$i(class = "fas fa-crosshairs", style = "margin-right:5px;"),
+            sprintf("%.5f, %.5f", rv$lat, rv$lon)
+          ),
+          tags$p(style = "margin-top:10px; font-size:0.85rem; color:#666;",
+            tags$i(class = "fas fa-check-circle", style = "color:#28a745;"),
+            " Coordenadas trasladadas al formulario de tasación"
+          )
+        )
+      )
+    }
+  })
+
+  # --- Mapa mini en el tasador ---
+  # renderLeaflet NO puede acceder a rv$ ni input$; usar valores literales para init
+  output$mapa_mini <- renderLeaflet({
+    leaflet() |>
+      addProviderTiles(providers$CartoDB.Positron) |>
+      addPolygons(
+        data        = barrios,
+        fillColor   = "#1a1a2e",
+        weight      = 1,
+        color       = "#e94560",
+        fillOpacity = 0.1,
+        label       = ~NOMBRE
+      ) |>
+      addCircleMarkers(
+        lng         = -3.703,
+        lat         = 40.416,
+        radius      = 10,
+        color       = "#e94560",
+        fillColor   = "#e94560",
+        fillOpacity = 0.9,
+        weight      = 2
+      ) |>
+      setView(lng = -3.703, lat = 40.416, zoom = 13)
+  })
+
+  # Actualizar marcador reactivamente cuando cambian rv$lat / rv$lon
+  # Usamos observeEvent sobre los inputs numéricos para no ejecutarse antes de tiempo
+  observeEvent(c(input$lat_input, input$lon_input), {
+    lat_actual <- input$lat_input
+    lon_actual <- input$lon_input
+    req(is.numeric(lat_actual), is.numeric(lon_actual),
+        !is.na(lat_actual), !is.na(lon_actual))
+    leafletProxy("mapa_mini") |>
+      clearMarkers() |>
+      addCircleMarkers(
+        lng         = lon_actual,
+        lat         = lat_actual,
+        radius      = 10,
+        color       = "#e94560",
+        fillColor   = "#e94560",
+        fillOpacity = 0.9,
+        weight      = 2,
+        popup       = paste0(
+          "<b>Localización seleccionada</b><br>",
+          sprintf("Lat: %.5f | Lon: %.5f", lat_actual, lon_actual)
+        )
+      ) |>
+      setView(lng = lon_actual, lat = lat_actual, zoom = 13)
+  }, ignoreNULL = TRUE, ignoreInit = FALSE)
+
+  # --- PREDICCIÓN ---
+  observeEvent(input$predecir, {
+    lat_val <- input$lat_input
+    lon_val <- input$lon_input
+
+    # Crear punto sf
+    nuevo_punto <- st_as_sf(
+      data.frame(lon = lon_val, lat = lat_val),
+      coords = c("lon", "lat"), crs = 4326
+    )
+    nuevo_punto_proj <- st_transform(nuevo_punto, 25830)
+
+    # Comprobar ventana de predicción
+    # ventana_prediccion es un sfc; lo convertimos a sf asegurándonos del CRS
+    ventana_sf <- st_as_sf(data.frame(geometry = ventana_prediccion)) |>
+      st_set_crs(25830) |>
+      st_transform(25830)
+    dentro <- tryCatch(
+      st_within(nuevo_punto_proj, ventana_sf, sparse = FALSE)[1, 1],
+      error = function(e) FALSE
+    )
+
+    rv$dentro_ventana <- dentro
+
+    if (!dentro) {
+      rv$resultado <- NULL
+      return()
+    }
+
+    # Calcular retardo espacial
+    lag_val <- calcular_lag_nuevo(nuevo_punto, datos_train, radio = 500, potencia = 2)
+
+    # Tomamos UNA fila del train como plantilla: así todos los tipos coinciden
+    # exactamente con lo que el recipe espera (factor, numeric, etc.)
+    datos_train_mod_tmp <- datos_train |>
+      sf::st_drop_geometry() |>
+      dplyr::select(-dplyr::any_of(c(
+        "X", "longitude", "latitude", "cluster_dbscan",
+        "precio_m2", "house.price", "precio_actualizado",
+        "res_lm", "res_rf", "res_lgbm", "res_svr", "res_knn", "res_gbm",
+        "res_lm_sp", "res_rf_sp", "res_lgbm_sp", "res_svr_sp", "res_knn_sp", "res_gbm_sp",
+        "log_precio_m2_w"
+      )))
+
+    # Fila plantilla: mediana/moda de cada columna según su tipo
+    fila_base <- datos_train_mod_tmp[1, , drop = FALSE]
+    for (col in names(fila_base)) {
+      if (is.numeric(fila_base[[col]])) {
+        fila_base[[col]] <- median(datos_train_mod_tmp[[col]], na.rm = TRUE)
+      } else if (is.factor(fila_base[[col]])) {
+        fila_base[[col]] <- factor(
+          names(sort(table(datos_train_mod_tmp[[col]]), decreasing = TRUE))[1],
+          levels = levels(datos_train_mod_tmp[[col]])
+        )
+      } else if (is.character(fila_base[[col]])) {
+        fila_base[[col]] <- names(sort(table(datos_train_mod_tmp[[col]]), decreasing = TRUE))[1]
+      } else if (is.logical(fila_base[[col]])) {
+        fila_base[[col]] <- as.logical(round(mean(datos_train_mod_tmp[[col]], na.rm = TRUE)))
+      }
+    }
+
+    # Función helper: convierte un valor al tipo que tiene esa columna en el train
+    forzar_tipo <- function(valor, col_referencia) {
+      if (is.factor(col_referencia)) {
+        lvls <- levels(col_referencia)
+        val_chr <- as.character(valor)
+        # Si el nivel existe, usarlo; si no, usar el más frecuente
+        if (val_chr %in% lvls) {
+          factor(val_chr, levels = lvls)
+        } else {
+          factor(lvls[1], levels = lvls)
+        }
+      } else if (is.integer(col_referencia)) {
+        as.integer(valor)
+      } else if (is.numeric(col_referencia)) {
+        as.numeric(valor)
+      } else if (is.logical(col_referencia)) {
+        as.logical(as.numeric(valor))
+      } else {
+        as.character(valor)
+      }
+    }
+
+    # Sobreescribir con los valores del usuario respetando el tipo de cada columna
+    vars_usuario <- list(
+      built.area    = input$built_area,
+      baths         = input$baths,
+      age           = input$age,
+      floor         = input$floor,
+      good.cond     = input$good_cond,
+      garage        = input$garage,
+      elevator      = input$elevator,
+      air.cond      = input$air_cond,
+      swimming.pool = input$swimming_pool,
+      type.house    = input$type_house,
+      log_precio_m2 = 0
+    )
+
+    for (var in names(vars_usuario)) {
+      if (var %in% names(fila_base)) {
+        fila_base[[var]] <- forzar_tipo(vars_usuario[[var]], datos_train_mod_tmp[[var]])
+      }
+    }
+
+    # Añadir retardo espacial (siempre numeric)
+    fila_base[["log_precio_m2_w"]] <- as.numeric(ifelse(
+      is.na(lag_val),
+      median(datos_train$log_precio_m2, na.rm = TRUE),
+      lag_val
+    ))
+
+    nueva_obs <- fila_base
+
+    withProgress(message = "Calculando tasación...", value = 0.5, {
+      tryCatch({
+        res <- predecir_precio(nueva_obs)
+        rv$resultado <- res
+      }, error = function(e) {
+        showNotification(paste("Error en la predicción:", e$message), type = "error")
+      })
+    })
+  })
+
+  # --- UI del resultado ---
+  output$resultado_ui <- renderUI({
+    if (!rv$dentro_ventana) {
+      return(
+        bs4Card(
+          width = 12, solidHeader = FALSE,
+          tags$div(class = "warning-box",
+            tags$h4(tags$i(class = "fas fa-exclamation-triangle"), " Fuera de la ventana de predicción"),
+            tags$p("La localización seleccionada está fuera del área de cobertura de los datos de entrenamiento. El modelo no puede hacer una predicción fiable para esta ubicación."),
+            tags$p(tags$small("Selecciona una ubicación dentro del área de Madrid cubierta por los datos de entrenamiento (radio de 500 metros alrededor de las viviendas observadas)."))
+          )
+        )
+      )
+    }
+
+    if (is.null(rv$resultado)) {
+      return(
+        bs4Card(
+          width = 12, solidHeader = FALSE,
+          tags$div(style = "text-align:center; padding:50px; color:#aaa;",
+            tags$i(class = "fas fa-home", style = "font-size:3rem; color:#dee2e6;"),
+            tags$h4(style = "margin-top:15px; font-weight:300;", "Introduce las características y pulsa"),
+            tags$h4(tags$strong("'Tasar vivienda'"), style = "color:#e94560;")
+          )
+        )
+      )
+    }
+
+    res <- rv$resultado
+    precio_m2    <- round(res$precio_m2, 0)
+    precio_total <- round(res$precio_m2 * input$built_area, 0)
+
+    tagList(
+      # RESULTADO PRINCIPAL
+      bs4Card(
+        width = 12, solidHeader = FALSE,
+        tags$div(class = "precio-box",
+          tags$div(class = "precio-label",
+            tags$i(class = "fas fa-tag"), " PRECIO ESTIMADO POR m²"
+          ),
+          tags$div(class = "precio-valor",
+            format(precio_m2, big.mark = ".", decimal.mark = ","), " €/m²"
+          ),
+          tags$div(class = "precio-total",
+            tags$i(class = "fas fa-home"), " Precio total estimado: ",
+            tags$strong(paste0(format(precio_total, big.mark = ".", decimal.mark = ","), " €"))
+          ),
+          tags$div(style = "margin-top:12px; opacity:0.7; font-size:0.8rem;",
+            tags$i(class="fas fa-calculator"),
+            sprintf(" %s m² × %s €/m²",
+                    format(input$built_area, big.mark="."),
+                    format(precio_m2, big.mark=".", decimal.mark=","))
+          )
+        )
+      ),
+
+      # DESGLOSE POR MODELO
+      bs4Card(
+        width = 12, solidHeader = FALSE,
+        header = tagList(
+          tags$i(class = "fas fa-layer-group", style = "margin-right:8px; color:#e94560;"),
+          "Desglose por modelo"
+        ),
+        fluidRow(
+          column(4,
+            tags$div(class = "metric-mini",
+              tags$div(class = "etiqueta", tags$span(class="badge-modelo", "LightGBM 35%")),
+              tags$div(class = "valor", paste0(format(round(res$pred_lgbm), big.mark="."), " €/m²"))
+            ),
+            tags$div(class = "metric-mini",
+              tags$div(class = "etiqueta", tags$span(class="badge-modelo", "Random Forest 35%")),
+              tags$div(class = "valor", paste0(format(round(res$pred_rf), big.mark="."), " €/m²"))
+            )
+          ),
+          column(4,
+            tags$div(class = "metric-mini",
+              tags$div(class = "etiqueta", tags$span(class="badge-modelo", "Gradient Boosting 15%")),
+              tags$div(class = "valor", paste0(format(round(res$pred_gbm), big.mark="."), " €/m²"))
+            ),
+            tags$div(class = "metric-mini",
+              tags$div(class = "etiqueta", tags$span(class="badge-modelo", "SVR 10%")),
+              tags$div(class = "valor", paste0(format(round(res$pred_svr), big.mark="."), " €/m²"))
+            )
+          ),
+          column(4,
+            tags$div(class = "metric-mini",
+              tags$div(class = "etiqueta", tags$span(class="badge-modelo", "KNN 5%")),
+              tags$div(class = "valor", paste0(format(round(res$pred_knn), big.mark="."), " €/m²"))
+            ),
+            tags$div(style="background:linear-gradient(135deg,#e94560,#c0392b); border-radius:10px; padding:12px 16px; color:white; margin-bottom:8px;",
+              tags$div(style="font-size:0.7rem; opacity:0.85;", "ENSAMBLADO FINAL"),
+              tags$div(style="font-size:1.4rem; font-weight:800;",
+                paste0(format(round(res$precio_m2), big.mark="."), " €/m²")
+              )
+            )
+          )
+        )
+      )
+    )
+  })
+
+  # --- Gráfico de modelos ---
+  output$grafico_modelos <- renderPlotly({
+    df_metricas <- data.frame(
+      Modelo = c(
+        "LightGBM espacial", "Random Forest espacial",
+        "Gradient Boosting espacial", "SVM espacial", "KNN espacial",
+        "Lineal espacial", "LightGBM", "Random Forest",
+        "Gradient Boosting", "SVM", "KNN", "Lineal", "Kriging"
+      ),
+      R2   = c(0.682, 0.675, 0.641, 0.622, 0.537, 0.521, 0.657, 0.653, 0.625, 0.608, 0.523, 0.486, 0.503),
+      RMSE = c(0.188, 0.190, 0.200, 0.206, 0.227, 0.231, 0.195, 0.197, 0.204, 0.208, 0.232, 0.238, 0.232),
+      Tipo = c(rep("Con dependencia espacial", 6), rep("Sin dependencia espacial", 6), "Kriging")
+    ) |>
+      arrange(R2)
+
+    colores <- c(
+      "Con dependencia espacial"  = "#e94560",
+      "Sin dependencia espacial"  = "#0f3460",
+      "Kriging"                   = "#888"
+    )
+
+    plot_ly(df_metricas,
+      x = ~R2,
+      y = ~reorder(Modelo, R2),
+      color = ~Tipo,
+      colors = colores,
+      type = "bar",
+      orientation = "h",
+      text = ~paste0("R² = ", sprintf("%.3f", R2), " | RMSE = ", sprintf("%.3f", RMSE)),
+      textposition = "outside",
+      hovertemplate = "<b>%{y}</b><br>R² = %{x:.3f}<extra></extra>"
+    ) |>
+      layout(
+        xaxis = list(title = "R² en test", range = c(0, 0.78)),
+        yaxis = list(title = ""),
+        legend = list(orientation = "h", y = -0.15),
+        plot_bgcolor  = "rgba(0,0,0,0)",
+        paper_bgcolor = "rgba(0,0,0,0)",
+        margin = list(l = 180, r = 60, t = 20, b = 60),
+        font = list(family = "Segoe UI", size = 11)
+      )
+  })
+
+  # --- Gráfico de pesos ---
+  output$grafico_pesos <- renderPlotly({
+    df_pesos <- data.frame(
+      Modelo = c("LightGBM", "Random Forest", "Gradient Boosting", "SVM", "KNN"),
+      Peso   = c(35, 35, 15, 10, 5)
+    )
+
+    plot_ly(df_pesos,
+      labels = ~Modelo,
+      values = ~Peso,
+      type   = "pie",
+      hole   = 0.55,
+      marker = list(colors = c("#e94560", "#0f3460", "#16213e", "#c0392b", "#888"),
+                    line = list(color = "white", width = 2)),
+      textinfo = "label+percent",
+      hovertemplate = "<b>%{label}</b><br>Peso: %{value}%<extra></extra>"
+    ) |>
+      layout(
+        showlegend     = FALSE,
+        plot_bgcolor   = "rgba(0,0,0,0)",
+        paper_bgcolor  = "rgba(0,0,0,0)",
+        margin         = list(l = 20, r = 20, t = 10, b = 10),
+        annotations    = list(
+          list(text = "Pesos<br>ensamblado", x = 0.5, y = 0.5,
+               showarrow = FALSE, font = list(size = 13, color = "#333", family = "Segoe UI"))
+        )
+      )
+  })
+
+}
+
+# =============================================================================
+# LANZAR APP
+# =============================================================================
+
+shinyApp(ui = ui, server = server)
+
+```
